@@ -1,6 +1,5 @@
-// File: api/proxy.js
 export const config = {
-  runtime: "nodejs", // ✅ fixed value
+  runtime: "nodejs",
 };
 
 export default async function handler(req, res) {
@@ -27,7 +26,16 @@ export default async function handler(req, res) {
       let text = await response.text();
       const base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-      // Rewrite .m3u8 references
+      // Rewrite "URI=" references inside #EXT-X-MEDIA lines
+      text = text.replace(
+        /URI="([^"]+)"/g,
+        (match, p1) =>
+          `URI="https://workingg.vercel.app/api/proxy?url=${encodeURIComponent(
+            new URL(p1, base).href
+          )}"`
+      );
+
+      // Rewrite playlist (.m3u8) and segment (.ts) references
       text = text.replace(
         /^(?!#)(.*\.m3u8(\?.*)?)$/gm,
         (m) =>
@@ -35,8 +43,6 @@ export default async function handler(req, res) {
             new URL(m, base).href
           )}`
       );
-
-      // Rewrite .ts segment references
       text = text.replace(
         /^(?!#)(.*\.ts(\?.*)?)$/gm,
         (m) =>
