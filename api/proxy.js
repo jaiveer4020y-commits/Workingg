@@ -5,12 +5,15 @@ export const config = {
 export default async function handler(req, res) {
   try {
     const targetUrl = req.query.url;
+    const format = req.query.format || "raw";
+
     if (!targetUrl) {
-      res.status(400).json({ error: "Missing url parameter" });
-      return;
+      return res.status(400).json({ error: "Missing 'url' query parameter" });
     }
 
-    const response = await fetch(targetUrl, {
+    const decodedUrl = decodeURIComponent(targetUrl);
+
+    const response = await fetch(decodedUrl, {
       headers: {
         Referer: "https://watchout.rpmvid.com",
         Origin: "https://watchout.rpmvid.com",
@@ -20,13 +23,26 @@ export default async function handler(req, res) {
     });
 
     const contentType = response.headers.get("content-type") || "";
+    const base = decodedUrl.substring(0, decodedUrl.lastIndexOf("/") + 1);
 
-    // --- Handle M3U8 playlists ---
+    // CORS headers
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+    // Handle CORS preflight
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
+
+    // ───────────────────────────────
+    // 🟩 Handle M3U8 playlists
+    // ───────────────────────────────
     if (contentType.includes("application/vnd.apple.mpegurl")) {
       let text = await response.text();
-      const base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-      // Rewrite "URI=" references inside #EXT-X-MEDIA lines
+      // Rewrite "URI=" references (audio, init segments, etc.)
       text = text.replace(
         /URI="([^"]+)"/g,
         (match, p1) =>
@@ -35,7 +51,7 @@ export default async function handler(req, res) {
           )}"`
       );
 
-      // Rewrite playlist (.m3u8) and segment (.ts) references
+      // Rewrite .m3u8 playlist references
       text = text.replace(
         /^(?!#)(.*\.m3u8(\?.*)?)$/gm,
         (m) =>
@@ -43,6 +59,8 @@ export default async function handler(req, res) {
             new URL(m, base).href
           )}`
       );
+
+      // Rewrite .ts segments
       text = text.replace(
         /^(?!#)(.*\.ts(\?.*)?)$/gm,
         (m) =>
@@ -51,31 +69,58 @@ export default async function handler(req, res) {
           )}`
       );
 
-      res.setHeader("Access-Control-Allow-Origin", "*");
+      // Rewrite .m4s segments
+      text = text.replace(
+        /^(?!#)(.*\.m4s(\?.*)?)$/gm,
+        (m) =>
+          `https://workingg.vercel.app/api/proxy?url=${encodeURIComponent(
+            new URL(m, base).href
+          )}`
+      );
+
+      // Return as JSON (debug mode)
+      if (format === "json") {
+        res.setHeader("Content-Type", "application/json");
+        return res.status(200).json({ content: text });
+      }
+
+      // Normal playback mode
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.status(200).send(text);
-      return;
+      return res.status(200).send(text);
     }
 
-    // --- Handle TS video segments ---
+    // ───────────────────────────────
+    // 🟨 Handle video segments (.ts, .m4s, .mp4)
+    // ───────────────────────────────
     if (
       targetUrl.endsWith(".ts") ||
+      targetUrl.endsWith(".m4s") ||
+      targetUrl.endsWith(".mp4") ||
       contentType.includes("video") ||
       contentType.includes("octet-stream")
     ) {
       const buffer = Buffer.from(await response.arrayBuffer());
-      res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Content-Type", contentType || "video/MP2T");
-      res.status(200).send(buffer);
-      return;
+      return res.status(200).send(buffer);
     }
 
-    // --- Fallback: forward any other file ---
+    // ───────────────────────────────
+    // 🟦 Handle JSON or text responses
+    // ───────────────────────────────
+    if (contentType.includes("application/json") || format === "json") {
+      const data = await response.text();
+      res.setHeader("Content-Type", "application/json");
+      return res.status(200).send(data);
+    }
+
+    // ───────────────────────────────
+    // 🟪 Default: forward everything else
+    // ───────────────────────────────
     const buffer = Buffer.from(await response.arrayBuffer());
-    res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Content-Type", contentType || "application/octet-stream");
-    res.status(200).send(buffer);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(200).send(buffer);
+  } catch (error) {
+    console.error("Proxy error:", error);
+    res.status(500).json({ error: error.message });
   }
 }
