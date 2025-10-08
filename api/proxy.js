@@ -1,7 +1,6 @@
 // File: api/proxy.js
-// File: api/proxy.js
 export const config = {
-  runtime: "nodejs20", // ensure proper stream handling
+  runtime: "nodejs", // ✅ fixed value
 };
 
 export default async function handler(req, res) {
@@ -28,6 +27,7 @@ export default async function handler(req, res) {
       let text = await response.text();
       const base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
+      // Rewrite .m3u8 references
       text = text.replace(
         /^(?!#)(.*\.m3u8(\?.*)?)$/gm,
         (m) =>
@@ -36,6 +36,7 @@ export default async function handler(req, res) {
           )}`
       );
 
+      // Rewrite .ts segment references
       text = text.replace(
         /^(?!#)(.*\.ts(\?.*)?)$/gm,
         (m) =>
