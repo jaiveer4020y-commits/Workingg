@@ -1,8 +1,18 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  images: {
-    domains: ['image.tmdb.org'],
+  reactStrictMode: false,
+  experimental: { appDir: true },
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'Access-Control-Allow-Origin', value: '*' },
+          { key: 'Access-Control-Allow-Headers', value: '*' },
+        ],
+      },
+    ];
   },
 };
 
-export default nextConfig;
+module.exports = nextConfig;
