@@ -6,8 +6,6 @@ export default async function handler(req, res) {
   try {
     const targetUrl = req.query.url;
     const format = req.query.format || "raw";
-    // 🛡️ NEW: Get custom referer from the query endpoint
-    const customRef = req.query.ref; 
 
     if (!targetUrl) {
       return res.status(400).json({ error: "Missing 'url' query parameter" });
@@ -15,13 +13,22 @@ export default async function handler(req, res) {
 
     const decodedUrl = decodeURIComponent(targetUrl);
 
-    // Determine headers: Use provided 'ref' endpoint, or fallback to default
-    const finalHeader = customRef ? decodeURIComponent(customRef) : "https://watchouteng.rpmvid.com";
+    // ───────────────────────────────
+    // 🛡️ DYNAMIC HEADER SELECTION
+    // ───────────────────────────────
+    // We determine the Referer/Origin based on the target URL content
+    let customHeader = "https://watchouteng.rpmvid.com"; // Default
+
+    if (decodedUrl.includes("streamp2p")) {
+      customHeader = "https://multimovies.p2pplay.pro";
+    } else if (decodedUrl.includes("streamwish")) {
+      customHeader = "https://multimoviesshg.com";
+    }
 
     const response = await fetch(decodedUrl, {
       headers: {
-        "Referer": finalHeader,
-        "Origin": finalHeader.replace(/\/$/, ""), // Clean trailing slash for Origin
+        Referer: customHeader,
+        Origin: customHeader,
         "User-Agent":
           "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
       },
@@ -30,43 +37,73 @@ export default async function handler(req, res) {
     const contentType = response.headers.get("content-type") || "";
     const base = decodedUrl.substring(0, decodedUrl.lastIndexOf("/") + 1);
 
-    // CORS Configuration
+    // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "*");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 
-    if (req.method === "OPTIONS") return res.status(204).end();
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
+    }
 
+    // ───────────────────────────────
     // 🟩 Handle M3U8 playlists
+    // ───────────────────────────────
     if (contentType.includes("application/vnd.apple.mpegurl")) {
       let text = await response.text();
-      
-      // Pass the 'ref' parameter down to all child segments automatically
-      const refParam = customRef ? `&ref=${encodeURIComponent(customRef)}` : "";
-      const proxyBase = `https://workingg.vercel.app/api/proxy?url=`;
+      const proxyBase = "https://workingg.vercel.app/api/proxy?url=";
 
-      // Rewrite URI lines
-      text = text.replace(/URI="([^"]+)"/g, (match, p1) => {
+      // Logic to rewrite URIs (Master Playlists, Segments, etc.)
+      const rewrite = (match, p1) => {
         const fullUrl = new URL(p1, base).href;
-        return `URI="${proxyBase}${encodeURIComponent(fullUrl)}${refParam}"`;
+        return `URI="${proxyBase}${encodeURIComponent(fullUrl)}"`;
+      };
+
+      text = text.replace(/URI="([^"]+)"/g, rewrite);
+
+      // Rewrite .m3u8, .ts, and .m4s references
+      const segmentRegex = /^(?!#)(.*(\.m3u8|\.ts|\.m4s)(\?.*)?)$/gm;
+      text = text.replace(segmentRegex, (m) => {
+        const fullUrl = new URL(m, base).href;
+        return `${proxyBase}${encodeURIComponent(fullUrl)}`;
       });
 
-      // Rewrite Playlist/Segment lines
-      text = text.replace(/^(?!#)(.*(\.m3u8|\.ts|\.m4s)(\?.*)?)$/gm, (m) => {
-        const fullUrl = new URL(m, base).href;
-        return `${proxyBase}${encodeURIComponent(fullUrl)}${refParam}`;
-      });
+      if (format === "json") {
+        res.setHeader("Content-Type", "application/json");
+        return res.status(200).json({ content: text });
+      }
 
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       return res.status(200).send(text);
     }
 
-    // 🟨 Handle Video Segments
+    // ───────────────────────────────
+    // 🟨 Handle video segments
+    // ───────────────────────────────
+    if (
+      targetUrl.endsWith(".ts") ||
+      targetUrl.endsWith(".m4s") ||
+      targetUrl.endsWith(".mp4") ||
+      contentType.includes("video") ||
+      contentType.includes("octet-stream")
+    ) {
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      res.setHeader("Content-Type", contentType || "video/MP2T");
+      return res.status(200).send(buffer);
+    }
+
+    // ───────────────────────────────
+    // 🟦 Default: forward everything else
+    // ───────────────────────────────
     const arrayBuffer = await response.arrayBuffer();
-    res.setHeader("Content-Type", contentType || "video/MP2T");
-    return res.status(200).send(Buffer.from(arrayBuffer));
+    const buffer = Buffer.from(arrayBuffer);
+    res.setHeader("Content-Type", contentType || "application/octet-stream");
+    return res.status(200).send(buffer);
 
   } catch (error) {
+    console.error("Proxy error:", error);
     res.status(500).json({ error: error.message });
   }
 }
