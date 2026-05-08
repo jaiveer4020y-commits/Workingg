@@ -6,7 +6,6 @@ export default async function handler(req, res) {
   try {
     const targetUrl = req.query.url;
     const format = req.query.format || "raw";
-    // source=1 → watchout (default), source=2 → streamp2p
     const source = req.query.source || "1";
 
     if (!targetUrl) {
@@ -15,15 +14,12 @@ export default async function handler(req, res) {
 
     const decodedUrl = decodeURIComponent(targetUrl);
 
-    // ───────────────────────────────
     // 🛡️ DYNAMIC HEADER SELECTION
-    // ───────────────────────────────
     let customHeader;
-
     if (source === "2" || decodedUrl.includes("streamp2p")) {
-      customHeader = "https://multimovies.p2pplay.pro"; // streamp2p
+      customHeader = "https://multimovies.p2pplay.pro";
     } else {
-      customHeader = "https://watchouteng.rpmvid.com"; // watchout (default)
+      customHeader = "https://watchouteng.rpmvid.com";
     }
 
     const response = await fetch(decodedUrl, {
@@ -49,26 +45,30 @@ export default async function handler(req, res) {
     }
 
     // ───────────────────────────────
-    // 🟩 Handle M3U8 playlists
+    // 🟩 Handle M3U8 & Subtitles
     // ───────────────────────────────
     if (contentType.includes("application/vnd.apple.mpegurl") || decodedUrl.includes(".m3u8")) {
       let text = await response.text();
       
-      // Dynamic base URL detection
       const protocol = req.headers["x-forwarded-proto"] || "https";
       const host = req.headers["host"];
       const proxyBase = `${protocol}://${host}/api/proxy?source=${source}&url=`;
 
-      // Rewrite URI="..." references (keys, subtitles, etc.)
-      const rewrite = (match, p1) => {
+      // 1. Rewrite General URI="..." (Keys, Maps, etc.)
+      text = text.replace(/URI="([^"]+)"/g, (match, p1) => {
         const fullUrl = new URL(p1, base).href;
         return `URI="${proxyBase}${encodeURIComponent(fullUrl)}"`;
-      };
+      });
 
-      text = text.replace(/URI="([^"]+)"/g, rewrite);
+      // 2. Rewrite Embedded HLS Subtitles / Audio Tracks 
+      // This specifically finds #EXT-X-MEDIA tags used for subtitles
+      text = text.replace(/TYPE=(SUBTITLES|AUDIO|CLOSED-CAPTIONS)(.*?)URI="([^"]+)"/g, (match, type, middle, uri) => {
+        const fullUrl = new URL(uri, base).href;
+        return `TYPE=${type}${middle}URI="${proxyBase}${encodeURIComponent(fullUrl)}"`;
+      });
 
-      // Rewrite .m3u8, .ts, and .m4s segment references
-      const segmentRegex = /^(?!#)(.*(\.m3u8|\.ts|\.m4s)(\?.*)?)$/gm;
+      // 3. Rewrite Segment references (.ts, .m3u8, .m4s, .vtt)
+      const segmentRegex = /^(?!#)(.*(\.m3u8|\.ts|\.m4s|\.vtt)(\?.*)?)$/gm;
       text = text.replace(segmentRegex, (m) => {
         const fullUrl = new URL(m, base).href;
         return `${proxyBase}${encodeURIComponent(fullUrl)}`;
@@ -84,12 +84,12 @@ export default async function handler(req, res) {
     }
 
     // ───────────────────────────────
-    // 🟨 Handle video segments & Default
+    // 🟨 Handle video segments, VTT, and everything else
     // ───────────────────────────────
     const arrayBuffer = await response.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     
-    // Set content type from response or default to octet-stream
+    // Set appropriate content type (crucial for .vtt or .ts)
     res.setHeader("Content-Type", contentType || "application/octet-stream");
     return res.status(200).send(buffer);
 
