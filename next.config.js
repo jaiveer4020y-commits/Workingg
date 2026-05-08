@@ -1,7 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
-  experimental: { appDir: false },
+  // The 'experimental' block was removed as 'appDir' is no longer needed
   async headers() {
     return [
       {
