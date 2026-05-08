@@ -1,15 +1,11 @@
 {
   "name": "workingg",
   "version": "1.0.0",
+  "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "dev": "vercel dev"
   },
   "dependencies": {
-    "next": "14.2.10",
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "@vercel/node": "latest"
   }
 }
-
