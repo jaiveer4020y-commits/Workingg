@@ -18,7 +18,8 @@ export default async function handler(req, res) {
     let customHeader;
     if (source === "2" || decodedUrl.includes("streamp2p")) {
       customHeader = "https://multimovies.p2pplay.pro";
-    } else {
+    }
+    if (source === "1" || decodedUrl.includes("streamp2p")) {
       customHeader = "https://watchouteng.rpmvid.com";
     }
 
