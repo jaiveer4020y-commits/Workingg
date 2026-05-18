@@ -22,6 +22,8 @@ export default async function handler(req, res) {
     if (source === "1" || decodedUrl.includes("streamp2p")) {
       customHeader = "https://watchouteng.rpmvid.com";
     }
+    if (source === "3" || decodedUrl.includes("streamp2p")) {
+      customHeader = "https://multimovies.fyi";
 
     const response = await fetch(decodedUrl, {
       headers: {
