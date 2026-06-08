@@ -25,7 +25,7 @@ export default async function handler(req, res) {
     const decodedUrl = decodeURIComponent(targetUrl);
 
     // ✅ Fixed header selection (was overwriting source=2 with source=1)
-    let customHeader = "https://multimovies.fyi"; // default
+    let customHeader = "https://allmovieland.one"; // default
 
     if (source === "2" || decodedUrl.includes("streamp2p")) {
       customHeader = "https://multimovies.p2pplay.pro";
