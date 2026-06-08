@@ -1,146 +1,49 @@
-export const config = {
-  runtime: "nodejs",
-};
+// api/proxy.js
 
 export default async function handler(req, res) {
-  // Handle CORS preflight first
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  // Enable CORS for browser requests
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
 
+  // Get the target URL from query parameter
+  const { url } = req.query;
+  if (!url) {
+    return res.status(400).json({ error: 'Missing "url" query parameter' });
+  }
+
+  // Required headers from your image
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+    'Referer': 'https://allmovieland.one/',
+    'Cache-Control': 'max-age=0',
+    'Host': new URL(url).hostname,
+    'Connection': 'Keep-Alive',
+    'Accept-Encoding': 'gzip'
+  };
+
   try {
-    const targetUrl = req.query.url;
-    const format = req.query.format || "raw";
-    const source = req.query.source || "1";
-
-    if (!targetUrl) {
-      return res.status(400).json({ error: "Missing 'url' query parameter" });
-    }
-
-    const decodedUrl = decodeURIComponent(targetUrl);
-
-    // ✅ Fixed header selection (was overwriting source=2 with source=1)
-    let customHeader = "https://allmovieland.one"; // default
-
-    if (source === "2" || decodedUrl.includes("streamp2p")) {
-      customHeader = "https://multimovies.p2pplay.pro";
-    } else if (source === "1") {
-      customHeader = "https://allmovieland.one";
-    }
-
-    const response = await fetch(decodedUrl, {
-      headers: {
-        Referer: customHeader + "/",
-        Origin: customHeader,
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        Accept: "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity", // avoid gzip so Buffer works cleanly
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
-      },
-      redirect: "follow",
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: headers
     });
 
-    // ✅ Log and forward non-OK responses clearly
     if (!response.ok) {
-      const body = await response.text();
-      console.error(`[PROXY ERROR] ${response.status} for: ${decodedUrl}`);
-      console.error(`[PROXY BODY] ${body.substring(0, 500)}`);
-      return res.status(response.status).send(body);
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    const base = decodedUrl.substring(0, decodedUrl.lastIndexOf("/") + 1);
-
-    const protocol = req.headers["x-forwarded-proto"] || "https";
-    const host = req.headers["host"];
-    const proxyBase = `${protocol}://${host}/api/proxy?source=${source}&url=`;
-
-    // ───────────────────────────────
-    // 🟩 Handle M3U8 playlists
-    // ───────────────────────────────
-    const isM3U8 =
-      contentType.includes("application/vnd.apple.mpegurl") ||
-      contentType.includes("application/x-mpegurl") ||
-      decodedUrl.includes(".m3u8");
-
-    if (isM3U8) {
-      let text = await response.text();
-
-      // 1. Rewrite URI="..." (encryption keys, maps, etc.)
-      text = text.replace(/URI="([^"]+)"/g, (match, p1) => {
-        try {
-          const fullUrl = new URL(p1, base).href;
-          return `URI="${proxyBase}${encodeURIComponent(fullUrl)}"`;
-        } catch {
-          return match;
-        }
+      return res.status(response.status).json({
+        error: `Upstream fetch failed with status ${response.status}`
       });
-
-      // 2. Rewrite #EXT-X-MEDIA subtitle/audio/caption track URIs
-      text = text.replace(
-        /TYPE=(SUBTITLES|AUDIO|CLOSED-CAPTIONS)(.*?)URI="([^"]+)"/g,
-        (match, type, middle, uri) => {
-          try {
-            const fullUrl = new URL(uri, base).href;
-            return `TYPE=${type}${middle}URI="${proxyBase}${encodeURIComponent(fullUrl)}"`;
-          } catch {
-            return match;
-          }
-        }
-      );
-
-      // 3. Rewrite segment lines (.ts, .m3u8, .m4s, .vtt, .aac, .mp4)
-      text = text.replace(
-        /^(?!#)(.+(\.m3u8|\.ts|\.m4s|\.vtt|\.aac|\.mp4)(\?.*)?)$/gm,
-        (m) => {
-          try {
-            const trimmed = m.trim();
-            const fullUrl = new URL(trimmed, base).href;
-            return `${proxyBase}${encodeURIComponent(fullUrl)}`;
-          } catch {
-            return m;
-          }
-        }
-      );
-
-      if (format === "json") {
-        res.setHeader("Content-Type", "application/json");
-        return res.status(200).json({ content: text });
-      }
-
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      return res.status(200).send(text);
     }
 
-    // ───────────────────────────────
-    // 🟨 Handle VTT subtitles
-    // ───────────────────────────────
-    if (contentType.includes("text/vtt") || decodedUrl.endsWith(".vtt")) {
-      const text = await response.text();
-      res.setHeader("Content-Type", "text/vtt; charset=utf-8");
-      return res.status(200).send(text);
-    }
-
-    // ───────────────────────────────
-    // 🟥 Handle binary segments (ts, m4s, aac, mp4, keys)
-    // ───────────────────────────────
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    res.setHeader("Content-Type", contentType || "application/octet-stream");
-    res.setHeader("Content-Length", buffer.length);
-    return res.status(200).send(buffer);
-
+    // Forward the response body (HTML, JSON, etc.)
+    const data = await response.text();
+    res.setHeader('Content-Type', response.headers.get('content-type') || 'text/html');
+    return res.status(200).send(data);
   } catch (error) {
-    console.error("[PROXY EXCEPTION]", error);
+    console.error(error);
     return res.status(500).json({ error: error.message });
   }
 }
