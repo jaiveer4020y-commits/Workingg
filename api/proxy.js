@@ -21,7 +21,7 @@ export default async function handler(req, res) {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
     'Referer': 'https://allmovieland.one/',
     'Cache-Control': 'max-age=0',
-    'Host': new URL(url).hostname,
+    'Host': 'gemma416okl.com',
     'Connection': 'Keep-Alive',
     'Accept-Encoding': 'gzip'
   };
