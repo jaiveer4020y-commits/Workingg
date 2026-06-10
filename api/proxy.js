@@ -1,9 +1,17 @@
+import { pipeline } from "stream";
+import { promisify } from "util";
+
+const streamPipeline = promisify(pipeline);
+
+// Optional: simple in‑memory cache for rewritten playlists (warm instances only)
+const playlistCache = new Map();
+
 export const config = {
-  runtime: "nodejs",
+  runtime: "nodejs", // can also be "edge" – see alternate version below
 };
 
 export default async function handler(req, res) {
-  // Handle CORS preflight first
+  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -24,14 +32,8 @@ export default async function handler(req, res) {
 
     const decodedUrl = decodeURIComponent(targetUrl);
 
-    // ✅ Fixed header selection (was overwriting source=2 with source=1)
-    let customHeader = "https://server1.uns.bio/"; // default
-
-    if (source === "2" || decodedUrl.includes("streamp2p")) {
-      customHeader = "https://server1.uns.bio/";
-    } else if (source === "1") {
-      customHeader = "https://server1.uns.bio/";
-    }
+    // Header selection (simplified – both source=1 and source=2 use same referer)
+    const customHeader = "https://server1.uns.bio/";
 
     const response = await fetch(decodedUrl, {
       headers: {
@@ -41,14 +43,14 @@ export default async function handler(req, res) {
           "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         Accept: "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity", // avoid gzip so Buffer works cleanly
+        // ✅ Allow compression – Vercel decompresses automatically
+        // "Accept-Encoding": "gzip, deflate, br",  // let browser decide, or omit
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "cross-site",
       },
       redirect: "follow",
     });
 
-    // ✅ Log and forward non-OK responses clearly
     if (!response.ok) {
       const body = await response.text();
       console.error(`[PROXY ERROR] ${response.status} for: ${decodedUrl}`);
@@ -58,23 +60,35 @@ export default async function handler(req, res) {
 
     const contentType = response.headers.get("content-type") || "";
     const base = decodedUrl.substring(0, decodedUrl.lastIndexOf("/") + 1);
-
     const protocol = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers["host"];
     const proxyBase = `${protocol}://${host}/api/proxy?source=${source}&url=`;
 
-    // ───────────────────────────────
+    // ─────────────────────────────────────────
     // 🟩 Handle M3U8 playlists
-    // ───────────────────────────────
+    // ─────────────────────────────────────────
     const isM3U8 =
       contentType.includes("application/vnd.apple.mpegurl") ||
       contentType.includes("application/x-mpegurl") ||
       decodedUrl.includes(".m3u8");
 
     if (isM3U8) {
+      // Check cache for this exact decodedUrl
+      const cached = playlistCache.get(decodedUrl);
+      if (cached && cached.expires > Date.now()) {
+        const text = cached.text;
+        if (format === "json") {
+          res.setHeader("Content-Type", "application/json");
+          return res.status(200).json({ content: text });
+        }
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        res.setHeader("Cache-Control", "public, max-age=5, stale-while-revalidate=60");
+        return res.status(200).send(text);
+      }
+
       let text = await response.text();
 
-      // 1. Rewrite URI="..." (encryption keys, maps, etc.)
+      // Rewrite URI="..."
       text = text.replace(/URI="([^"]+)"/g, (match, p1) => {
         try {
           const fullUrl = new URL(p1, base).href;
@@ -84,7 +98,7 @@ export default async function handler(req, res) {
         }
       });
 
-      // 2. Rewrite #EXT-X-MEDIA subtitle/audio/caption track URIs
+      // Rewrite TYPE=... URI="..."
       text = text.replace(
         /TYPE=(SUBTITLES|AUDIO|CLOSED-CAPTIONS)(.*?)URI="([^"]+)"/g,
         (match, type, middle, uri) => {
@@ -97,7 +111,7 @@ export default async function handler(req, res) {
         }
       );
 
-      // 3. Rewrite segment lines (.ts, .m3u8, .m4s, .vtt, .aac, .mp4)
+      // Rewrite segment lines
       text = text.replace(
         /^(?!#)(.+(\.m3u8|\.ts|\.m4s|\.vtt|\.aac|\.mp4)(\?.*)?)$/gm,
         (m) => {
@@ -111,34 +125,50 @@ export default async function handler(req, res) {
         }
       );
 
+      // Store in cache (5 seconds TTL)
+      playlistCache.set(decodedUrl, {
+        text: text,
+        expires: Date.now() + 5000,
+      });
+
       if (format === "json") {
         res.setHeader("Content-Type", "application/json");
         return res.status(200).json({ content: text });
       }
 
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "public, max-age=5, stale-while-revalidate=60");
       return res.status(200).send(text);
     }
 
-    // ───────────────────────────────
+    // ─────────────────────────────────────────
     // 🟨 Handle VTT subtitles
-    // ───────────────────────────────
+    // ─────────────────────────────────────────
     if (contentType.includes("text/vtt") || decodedUrl.endsWith(".vtt")) {
       const text = await response.text();
       res.setHeader("Content-Type", "text/vtt; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=86400"); // cache subtitles
       return res.status(200).send(text);
     }
 
-    // ───────────────────────────────
-    // 🟥 Handle binary segments (ts, m4s, aac, mp4, keys)
-    // ───────────────────────────────
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
+    // ─────────────────────────────────────────
+    // 🟥 Handle binary fragments (TS, M4S, MP4, keys)
+    // ─────────────────────────────────────────
     res.setHeader("Content-Type", contentType || "application/octet-stream");
-    res.setHeader("Content-Length", buffer.length);
-    return res.status(200).send(buffer);
+    // Allow clients/CDN to cache fragments for a short time
+    res.setHeader("Cache-Control", "public, max-age=10");
 
+    // ✅ Stream the response directly – no Buffer, no arrayBuffer
+    if (response.body) {
+      await streamPipeline(response.body, res);
+      return;
+    } else {
+      // Fallback for very old environments (should not happen with modern fetch)
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      res.setHeader("Content-Length", buffer.length);
+      return res.status(200).send(buffer);
+    }
   } catch (error) {
     console.error("[PROXY EXCEPTION]", error);
     return res.status(500).json({ error: error.message });
