@@ -22,7 +22,19 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Missing 'url' query parameter" });
     }
 
-    const decodedUrl = decodeURIComponent(targetUrl);
+    let decodedUrl = decodeURIComponent(targetUrl);
+
+// If additional query parameters were parsed by Vercel,
+// append them back onto the target URL.
+const extra = { ...req.query };
+delete extra.url;
+delete extra.format;
+delete extra.source;
+
+const qs = new URLSearchParams(extra).toString();
+if (qs) {
+  decodedUrl += (decodedUrl.includes("?") ? "&" : "?") + qs;
+}
 
     // ✅ Fixed header selection (was overwriting source=2 with source=1)
     let customHeader = "https://server1.uns.bio/"; // default
