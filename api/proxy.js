@@ -50,7 +50,7 @@ export default async function handler(req, res) {
     const decodedUrl = decodeURIComponent(targetUrl);
     const urlObj = new URL(decodedUrl);
     const agent = getAgent(urlObj.hostname);
-    const customHeader = "https://multimoviesshg.com/";
+    const customHeader = "";
 
     // Helper to make proxied request using native https
     const proxyRequest = (url, headers = {}) => {
