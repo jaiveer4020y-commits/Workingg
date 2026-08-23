@@ -37,12 +37,12 @@ if (qs) {
 }
 
     // ✅ Fixed header selection (was overwriting source=2 with source=1)
-    let customHeader = "https://streamhg.com/"; // default
+    let customHeader = "https://server1.uns.bio/"; // default
 
     if (source === "2" || decodedUrl.includes("streamp2p")) {
-      customHeader = "https://streamhg.com/";
+      customHeader = "https://server1.uns.bio/";
     } else if (source === "1") {
-      customHeader = "https://streamhg.com/";
+      customHeader = "https://server1.uns.bio/";
     }
 
     const response = await fetch(decodedUrl, {
