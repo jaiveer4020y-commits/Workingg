@@ -2,8 +2,8 @@ export const config = {
   runtime: "nodejs",
 };
 
-const UPSTREAM_REFERER = "https://hanerix.com/";
-const UPSTREAM_ORIGIN = "https://hanerix.com/";
+const UPSTREAM_REFERER = "https://multimovies.rpmhub.site/";
+const UPSTREAM_ORIGIN = "https://multimovies.rpmhub.site";
 
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
