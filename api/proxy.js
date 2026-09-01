@@ -84,7 +84,7 @@ function getProxyBase(req, source) {
     req.headers["x-forwarded-host"] ||
     req.headers.host;
 
-  return `${proto}://${host}/api/proxy?source=${encodeURIComponent(
+  return `${proto}://${host}/api/proxy?{encodeURIComponent(
     source
   )}&url=`;
 }
