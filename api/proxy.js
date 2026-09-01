@@ -84,9 +84,7 @@ function getProxyBase(req, source) {
     req.headers["x-forwarded-host"] ||
     req.headers.host;
 
-  return `${proto}://${host}/api/proxy?{encodeURIComponent(
-    source
-  )}&url=`;
+  return `${proto}://${host}/api/proxy?url=`;
 }
 
 function rewritePlaylist(text, playlistUrl, proxyBase) {
