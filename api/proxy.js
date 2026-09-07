@@ -1,26 +1,61 @@
 // api/proxy.js
 
+import http from "node:http";
+import https from "node:https";
+import { URL } from "node:url";
+
 export const config = {
   runtime: "nodejs",
 };
 
-const UPSTREAM_REFERER = "https://multimovies.rpmhub.site/";
-const UPSTREAM_ORIGIN = "https://multimovies.rpmhub.site";
+
+// ═══════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════
+
+const REFERER = "https://multimovies.rpmhub.site/";
+const ORIGIN = "https://multimovies.rpmhub.site";
 
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
 
-// ─────────────────────────────────────────────
-// CORS
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
+// KEEP-ALIVE AGENTS
+//
+// IMPORTANT:
+// These are created once per warm Vercel instance,
+// instead of creating a new connection every request.
+// ═══════════════════════════════════════════════
 
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 100,
+  maxFreeSockets: 25,
+  keepAliveMsecs: 1000,
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 100,
+  maxFreeSockets: 25,
+  keepAliveMsecs: 1000,
+});
+
+
+// ═══════════════════════════════════════════════
+// CORS
+// ═══════════════════════════════════════════════
+
+function cors(res) {
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
 
   res.setHeader(
     "Access-Control-Allow-Methods",
-    "GET, HEAD, OPTIONS"
+    "GET,HEAD,OPTIONS"
   );
 
   res.setHeader(
@@ -47,58 +82,52 @@ function setCors(res) {
 }
 
 
-// ─────────────────────────────────────────────
-// GET TARGET URL
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
+// GET URL
+// ═══════════════════════════════════════════════
 
-function getTargetUrl(req) {
-  let target = req.query.url;
+function getTarget(req) {
+  let value = req.query.url;
 
-  if (!target) {
-    throw new Error("Missing 'url' query parameter");
+  if (!value) {
+    throw new Error(
+      "Missing url parameter"
+    );
   }
 
-  if (Array.isArray(target)) {
-    target = target[0];
+  if (Array.isArray(value)) {
+    value = value[0];
   }
 
-  target = String(target);
+  value = String(value);
 
   /*
-   * Vercel normally gives req.query values decoded.
-   * Only attempt decoding when it is clearly encoded.
+   * Decode only when the URL itself is encoded.
    */
   try {
     if (
-      target.startsWith("http%3A") ||
-      target.startsWith("https%3A")
+      value.startsWith("http%3A") ||
+      value.startsWith("https%3A")
     ) {
-      target = decodeURIComponent(target);
+      value = decodeURIComponent(value);
     }
-  } catch {
-    // Keep original URL if decoding fails.
-  }
+  } catch {}
 
-  const url = new URL(target);
+  const url = new URL(value);
 
   if (
     url.protocol !== "http:" &&
     url.protocol !== "https:"
   ) {
-    throw new Error("Only HTTP/HTTPS URLs are supported");
+    throw new Error(
+      "Invalid URL protocol"
+    );
   }
 
   /*
-   * If the user supplied additional query parameters
-   * outside `url`, preserve them.
+   * Preserve additional query parameters.
    *
-   * Example:
-   *
-   * ?url=https://site/video.m3u8&v=123
-   *
-   * becomes:
-   *
-   * https://site/video.m3u8?v=123
+   * /api/proxy?url=...&v=123
    */
 
   const extra = {
@@ -108,20 +137,20 @@ function getTargetUrl(req) {
   delete extra.url;
   delete extra.format;
 
-  for (const [key, value] of Object.entries(extra)) {
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item !== undefined) {
-          url.searchParams.append(
-            key,
-            String(item)
-          );
-        }
+  for (const [key, val] of Object.entries(extra)) {
+    if (val === undefined) continue;
+
+    if (Array.isArray(val)) {
+      for (const x of val) {
+        url.searchParams.append(
+          key,
+          String(x)
+        );
       }
-    } else if (value !== undefined) {
+    } else {
       url.searchParams.set(
         key,
-        String(value)
+        String(val)
       );
     }
   }
@@ -130,16 +159,16 @@ function getTargetUrl(req) {
 }
 
 
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
 // PROXY BASE
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
 
-function getProxyBase(req) {
-  const forwardedProto =
-    req.headers["x-forwarded-proto"] || "https";
-
-  const protocol =
-    String(forwardedProto)
+function proxyBase(req) {
+  const proto =
+    String(
+      req.headers["x-forwarded-proto"] ||
+      "https"
+    )
       .split(",")[0]
       .trim();
 
@@ -147,46 +176,55 @@ function getProxyBase(req) {
     req.headers["x-forwarded-host"] ||
     req.headers.host;
 
-  return `${protocol}://${host}/api/proxy?url=`;
+  return `${proto}://${host}/api/proxy?url=`;
 }
 
 
-// ─────────────────────────────────────────────
-// PLAYLIST REWRITER
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
+// REWRITE M3U8
+// ═══════════════════════════════════════════════
 
 function rewritePlaylist(
-  playlist,
+  text,
   playlistUrl,
-  proxyBase
+  proxy
 ) {
-  const baseUrl =
-    new URL("./", playlistUrl).href;
+  const base =
+    new URL(
+      "./",
+      playlistUrl
+    ).href;
 
 
   /*
-   * Rewrite every URI="..."
+   * URI="..."
    *
    * Handles:
    *
    * EXT-X-KEY
    * EXT-X-MAP
    * EXT-X-MEDIA
-   * EXT-X-I-FRAMES-ONLY
    * EXT-X-PART
    * etc.
    */
 
-  playlist = playlist.replace(
+  text = text.replace(
     /URI="([^"]+)"/g,
     (match, uri) => {
       try {
         const absolute =
-          new URL(uri, baseUrl).href;
+          new URL(
+            uri,
+            base
+          ).href;
 
-        return `URI="${proxyBase}${encodeURIComponent(
-          absolute
-        )}"`;
+        return (
+          `URI="${proxy}` +
+          encodeURIComponent(
+            absolute
+          ) +
+          `"`
+        );
       } catch {
         return match;
       }
@@ -195,28 +233,21 @@ function rewritePlaylist(
 
 
   /*
-   * Rewrite normal playlist lines.
-   *
-   * This covers:
-   *
-   * .m3u8
-   * .ts
-   * .m4s
-   * .mp4
-   * .aac
-   * .vtt
-   * and URLs without extensions.
+   * Normal segment / playlist lines.
    */
 
   const lines =
-    playlist.split(/\r?\n/);
+    text.split(/\r?\n/);
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+  for (
+    let i = 0;
+    i < lines.length;
+    i++
+  ) {
+    const line =
+      lines[i].trim();
 
-    if (!line) {
-      continue;
-    }
+    if (!line) continue;
 
     if (line.startsWith("#")) {
       continue;
@@ -224,14 +255,19 @@ function rewritePlaylist(
 
     try {
       const absolute =
-        new URL(line, baseUrl).href;
+        new URL(
+          line,
+          base
+        ).href;
 
       lines[i] =
-        proxyBase +
-        encodeURIComponent(absolute);
+        proxy +
+        encodeURIComponent(
+          absolute
+        );
 
     } catch {
-      // Keep original line.
+      // Keep original.
     }
   }
 
@@ -239,56 +275,326 @@ function rewritePlaylist(
 }
 
 
-// ─────────────────────────────────────────────
-// COPY IMPORTANT RESPONSE HEADERS
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
+// DETECT PLAYLIST
+// ═══════════════════════════════════════════════
 
-function copyResponseHeaders(
+function isPlaylist(
+  target,
+  contentType
+) {
+  const path =
+    target.pathname.toLowerCase();
+
+  return (
+    path.endsWith(".m3u8") ||
+    path.endsWith(".m3u") ||
+    contentType.includes("mpegurl")
+  );
+}
+
+
+// ═══════════════════════════════════════════════
+// DETECT VTT
+// ═══════════════════════════════════════════════
+
+function isVtt(
+  target,
+  contentType
+) {
+  return (
+    target.pathname
+      .toLowerCase()
+      .endsWith(".vtt") ||
+    contentType.includes(
+      "text/vtt"
+    )
+  );
+}
+
+
+// ═══════════════════════════════════════════════
+// COPY RESPONSE HEADERS
+// ═══════════════════════════════════════════════
+
+function copyHeaders(
   upstream,
   res
 ) {
-  const headers = [
+  const allowed = [
     "content-type",
     "content-length",
     "content-range",
     "accept-ranges",
     "etag",
-    "last-modified"
+    "last-modified",
   ];
 
-  for (const name of headers) {
+  for (const name of allowed) {
     const value =
-      upstream.headers.get(name);
+      upstream.headers[name];
 
-    if (value) {
-      res.setHeader(name, value);
+    if (
+      value !== undefined
+    ) {
+      res.setHeader(
+        name,
+        value
+      );
     }
   }
 }
 
 
-// ─────────────────────────────────────────────
-// MAIN HANDLER
-// ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════
+// NATIVE HTTP FETCH
+//
+// This avoids:
+// fetch()
+// → WebStream
+// → getReader()
+// → Buffer.from()
+// → res.write()
+//
+// For media:
+// upstream.pipe(res)
+//
+// ═══════════════════════════════════════════════
+
+function requestUpstream(
+  target,
+  req,
+  redirects = 0
+) {
+  return new Promise(
+    (resolve, reject) => {
+
+      if (redirects > 5) {
+        reject(
+          new Error(
+            "Too many redirects"
+          )
+        );
+
+        return;
+      }
+
+
+      const isHttps =
+        target.protocol ===
+        "https:";
+
+      const transport =
+        isHttps
+          ? https
+          : http;
+
+      const agent =
+        isHttps
+          ? httpsAgent
+          : httpAgent;
+
+
+      const headers = {
+        "User-Agent":
+          USER_AGENT,
+
+        "Referer":
+          REFERER,
+
+        "Origin":
+          ORIGIN,
+
+        "Accept":
+          "*/*",
+
+        "Accept-Language":
+          "en-US,en;q=0.9",
+
+        /*
+         * Do not force gzip.
+         *
+         * Binary media doesn't benefit
+         * from compression.
+         */
+
+        "Accept-Encoding":
+          "identity",
+      };
+
+
+      /*
+       * VERY IMPORTANT:
+       * Forward Range.
+       */
+
+      if (
+        req.headers.range
+      ) {
+        headers.Range =
+          req.headers.range;
+      }
+
+
+      /*
+       * Forward validators.
+       */
+
+      if (
+        req.headers[
+          "if-none-match"
+        ]
+      ) {
+        headers[
+          "If-None-Match"
+        ] =
+          req.headers[
+            "if-none-match"
+          ];
+      }
+
+      if (
+        req.headers[
+          "if-modified-since"
+        ]
+      ) {
+        headers[
+          "If-Modified-Since"
+        ] =
+          req.headers[
+            "if-modified-since"
+          ];
+      }
+
+
+      const options = {
+        protocol:
+          target.protocol,
+
+        hostname:
+          target.hostname,
+
+        port:
+          target.port ||
+          (isHttps
+            ? 443
+            : 80),
+
+        path:
+          target.pathname +
+          target.search,
+
+        method:
+          req.method,
+
+        headers,
+
+        agent,
+
+        /*
+         * Don't leave a dead origin
+         * hanging forever.
+         */
+
+        timeout: 15000,
+      };
+
+
+      const upstream =
+        transport.request(
+          options,
+          (response) => {
+
+            /*
+             * Handle redirect manually.
+             */
+
+            if (
+              response.statusCode >=
+                300 &&
+              response.statusCode <
+                400 &&
+              response.headers.location
+            ) {
+
+              const redirected =
+                new URL(
+                  response.headers.location,
+                  target
+                );
+
+              response.resume();
+
+              return requestUpstream(
+                redirected,
+                req,
+                redirects + 1
+              )
+                .then(resolve)
+                .catch(reject);
+            }
+
+
+            resolve({
+              response,
+              target,
+            });
+          }
+        );
+
+
+      upstream.on(
+        "timeout",
+        () => {
+          upstream.destroy(
+            new Error(
+              "Upstream timeout"
+            )
+          );
+        }
+      );
+
+
+      upstream.on(
+        "error",
+        reject
+      );
+
+
+      upstream.end();
+    }
+  );
+}
+
+
+// ═══════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════
 
 export default async function handler(
   req,
   res
 ) {
-  setCors(res);
+  cors(res);
 
-  /*
-   * CORS preflight
-   */
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+  // ───────────────────────────────────────────
+  // OPTIONS
+  // ───────────────────────────────────────────
+
+  if (
+    req.method ===
+    "OPTIONS"
+  ) {
+    return res
+      .status(204)
+      .end();
   }
 
 
-  /*
-   * Only GET / HEAD
-   */
+  // ───────────────────────────────────────────
+  // METHODS
+  // ───────────────────────────────────────────
 
   if (
     req.method !== "GET" &&
@@ -299,191 +605,134 @@ export default async function handler(
       "GET, HEAD, OPTIONS"
     );
 
-    return res.status(405).json({
-      error: "Method not allowed"
-    });
+    return res
+      .status(405)
+      .json({
+        error:
+          "Method not allowed"
+      });
   }
 
 
   try {
 
-    // ───────────────────────────────────────
-    // TARGET
-    // ───────────────────────────────────────
-
-    const targetUrl =
-      getTargetUrl(req);
-
     const target =
-      targetUrl.href;
+      getTarget(req);
 
 
     console.log(
-      `[PROXY] ${req.method} ${target}`
+      `[PROXY] ${req.method} ${target.href}`
     );
 
 
-    // ───────────────────────────────────────
-    // UPSTREAM REQUEST HEADERS
-    // ───────────────────────────────────────
+    // ─────────────────────────────────────────
+    // UPSTREAM
+    // ─────────────────────────────────────────
 
-    const headers = {
-      "User-Agent": USER_AGENT,
-
-      "Referer": UPSTREAM_REFERER,
-
-      "Origin": UPSTREAM_ORIGIN,
-
-      "Accept": "*/*",
-
-      "Accept-Language":
-        "en-US,en;q=0.9",
-
-      /*
-       * Avoid compressed binary responses
-       * because we are streaming them directly.
-       */
-      "Accept-Encoding": "identity",
-
-      /*
-       * Some origins inspect these.
-       */
-      "Sec-Fetch-Mode": "cors",
-
-      "Sec-Fetch-Site": "cross-site"
-    };
-
-
-    // ───────────────────────────────────────
-    // RANGE SUPPORT
-    // ───────────────────────────────────────
-
-    if (req.headers.range) {
-      headers.Range =
-        req.headers.range;
-    }
-
-
-    // ───────────────────────────────────────
-    // CONDITIONAL REQUESTS
-    // ───────────────────────────────────────
-
-    if (req.headers["if-none-match"]) {
-      headers["If-None-Match"] =
-        req.headers["if-none-match"];
-    }
-
-    if (req.headers["if-modified-since"]) {
-      headers["If-Modified-Since"] =
-        req.headers["if-modified-since"];
-    }
-
-
-    // ───────────────────────────────────────
-    // UPSTREAM FETCH
-    // ───────────────────────────────────────
-
-    const upstream =
-      await fetch(target, {
-        method: req.method,
-        headers,
-
-        /*
-         * Follow StreamHG/origin redirects.
-         */
-        redirect: "follow"
-      });
+    const {
+      response: upstream,
+      target: finalTarget
+    } =
+      await requestUpstream(
+        target,
+        req
+      );
 
 
     const status =
-      upstream.status;
+      upstream.statusCode ||
+      500;
 
 
-    // ───────────────────────────────────────
-    // ERROR RESPONSE
-    // ───────────────────────────────────────
+    // ─────────────────────────────────────────
+    // STATUS
+    // ─────────────────────────────────────────
 
     if (
       status !== 200 &&
       status !== 206 &&
       status !== 304
     ) {
-      let errorBody = "";
 
-      try {
-        errorBody =
-          await upstream.text();
-      } catch {}
+      let body = "";
+
+      upstream.setEncoding(
+        "utf8"
+      );
+
+      for await (
+        const chunk of upstream
+      ) {
+        body += chunk;
+
+        if (
+          body.length > 5000
+        ) {
+          break;
+        }
+      }
 
       console.error(
-        `[UPSTREAM ERROR] ${status} ${target}`
+        `[UPSTREAM ${status}] ${finalTarget.href}`
       );
 
       return res
         .status(status)
-        .send(
-          errorBody ||
-          `Upstream returned ${status}`
-        );
+        .send(body);
     }
 
 
-    // ───────────────────────────────────────
-    // CONTENT TYPE
-    // ───────────────────────────────────────
-
     const contentType =
-      upstream.headers.get(
-        "content-type"
-      ) || "";
-
-    const pathname =
-      targetUrl.pathname.toLowerCase();
-
-
-    // ───────────────────────────────────────
-    // DETECT M3U8
-    // ───────────────────────────────────────
-
-    const isM3U8 =
-      contentType.includes(
-        "application/vnd.apple.mpegurl"
-      ) ||
-      contentType.includes(
-        "application/x-mpegurl"
-      ) ||
-      contentType.includes(
-        "mpegurl"
-      ) ||
-      pathname.endsWith(".m3u8") ||
-      pathname.endsWith(".m3u");
+      String(
+        upstream.headers[
+          "content-type"
+        ] || ""
+      );
 
 
-    // ───────────────────────────────────────
+    // ─────────────────────────────────────────
     // M3U8
-    // ───────────────────────────────────────
+    // ─────────────────────────────────────────
 
-    if (isM3U8) {
+    if (
+      isPlaylist(
+        finalTarget,
+        contentType
+      )
+    ) {
 
-      const playlist =
-        await upstream.text();
+      let body = "";
 
-      const proxyBase =
-        getProxyBase(req);
+      upstream.setEncoding(
+        "utf8"
+      );
+
+      for await (
+        const chunk of upstream
+      ) {
+        body += chunk;
+      }
+
 
       const rewritten =
         rewritePlaylist(
-          playlist,
-          target,
-          proxyBase
+          body,
+          finalTarget.href,
+          proxyBase(req)
         );
 
 
+      res.statusCode = 200;
+
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.apple.mpegurl"
+      );
+
+
       /*
-       * Very short cache.
-       *
-       * Good for VOD and also avoids
-       * excessively stale live playlists.
+       * Don't cache live playlists for long.
        */
 
       res.setHeader(
@@ -492,91 +741,108 @@ export default async function handler(
       );
 
 
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.apple.mpegurl"
-      );
-
-
-      /*
-       * Optional:
-       *
-       * ?format=json
-       */
-
       if (
-        String(req.query.format || "")
-          .toLowerCase() === "json"
+        String(
+          req.query.format || ""
+        ).toLowerCase() ===
+        "json"
       ) {
+
         res.setHeader(
           "Content-Type",
           "application/json"
         );
 
-        return res.status(200).json({
-          content: rewritten
-        });
+        return res.end(
+          JSON.stringify({
+            content:
+              rewritten
+          })
+        );
       }
 
 
-      return res
-        .status(200)
-        .send(rewritten);
+      return res.end(
+        rewritten
+      );
     }
 
 
-    // ───────────────────────────────────────
-    // VTT SUBTITLE
-    // ───────────────────────────────────────
+    // ─────────────────────────────────────────
+    // VTT
+    // ─────────────────────────────────────────
 
-    const isVTT =
-      contentType.includes("text/vtt") ||
-      pathname.endsWith(".vtt");
+    if (
+      isVtt(
+        finalTarget,
+        contentType
+      )
+    ) {
+
+      let body = "";
+
+      upstream.setEncoding(
+        "utf8"
+      );
+
+      for await (
+        const chunk of upstream
+      ) {
+        body += chunk;
+      }
 
 
-    if (isVTT) {
+      res.statusCode =
+        status;
 
-      const text =
-        await upstream.text();
 
       res.setHeader(
         "Content-Type",
         "text/vtt; charset=utf-8"
       );
 
+
       res.setHeader(
         "Cache-Control",
         "public, max-age=300, s-maxage=300"
       );
 
-      return res
-        .status(status)
-        .send(text);
+
+      return res.end(
+        body
+      );
     }
 
 
-    // ───────────────────────────────────────
-    // EVERYTHING ELSE = STREAM
+    // ═════════════════════════════════════════
+    // MEDIA
     //
-    // TS / MP2T
+    // MP2T
+    // TS
     // M4S
     // MP4
     // AAC
     // KEY
-    // etc.
-    // ───────────────────────────────────────
+    //
+    // NO arrayBuffer()
+    // NO Buffer.from()
+    // NO manual chunks
+    //
+    // DIRECT PIPE
+    // ═════════════════════════════════════════
 
-    copyResponseHeaders(
+    copyHeaders(
       upstream,
       res
     );
 
 
+    res.statusCode =
+      status;
+
+
     /*
      * VOD fragments can be cached.
-     *
-     * This helps when the same fragment
-     * is requested again.
      */
 
     res.setHeader(
@@ -586,8 +852,8 @@ export default async function handler(
 
 
     /*
-     * Tell intermediaries not to buffer
-     * where supported.
+     * Ask compatible proxies not
+     * to buffer the response.
      */
 
     res.setHeader(
@@ -597,98 +863,65 @@ export default async function handler(
 
 
     /*
-     * HEAD has no body.
+     * HEAD.
      */
 
     if (
-      req.method === "HEAD" ||
-      !upstream.body
+      req.method === "HEAD"
     ) {
-      return res
-        .status(status)
-        .end();
+      upstream.resume();
+
+      return res.end();
     }
 
 
     /*
-     * Send headers immediately.
+     * THE IMPORTANT PART.
+     *
+     * Node pipes the upstream socket
+     * directly into the Vercel response.
      */
 
-    if (
-      typeof res.flushHeaders === "function"
-    ) {
-      res.flushHeaders();
-    }
+    upstream.pipe(res);
 
 
-    // ───────────────────────────────────────
-    // DIRECT STREAM
-    // ───────────────────────────────────────
+    /*
+     * If client disconnects,
+     * stop downloading the segment.
+     */
 
-    const reader =
-      upstream.body.getReader();
-
-
-    try {
-
-      while (true) {
-
-        const {
-          done,
-          value
-        } = await reader.read();
-
-
-        if (done) {
-          break;
-        }
-
-
-        if (value) {
-
-          /*
-           * Immediately forward each
-           * received chunk.
-           */
-
-          res.write(
-            Buffer.from(value)
-          );
+    req.on(
+      "close",
+      () => {
+        if (
+          !res.writableEnded
+        ) {
+          upstream.destroy();
         }
       }
+    );
 
-
-      res.end();
-
-    } catch (streamError) {
-
-      console.error(
-        "[STREAM ERROR]",
-        streamError
-      );
-
-      try {
-        res.destroy(streamError);
-      } catch {}
-    }
 
   } catch (error) {
 
     console.error(
-      "[PROXY EXCEPTION]",
+      "[PROXY ERROR]",
       error
     );
 
-    if (!res.headersSent) {
 
+    if (
+      !res.headersSent
+    ) {
       return res
-        .status(500)
+        .status(502)
         .json({
           error:
             error?.message ||
-            "Proxy error"
+            "Bad gateway"
         });
     }
+
 
     try {
       res.destroy(error);
