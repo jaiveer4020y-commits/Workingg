@@ -13,8 +13,8 @@ export const config = {
 // CONFIG
 // ═══════════════════════════════════════════════
 
-const REFERER = "https://movieboxonline.net/";
-const ORIGIN = "https://movieboxonline.net";
+const REFERER = "https://fmoviesunblocked.net/";
+const ORIGIN = "https://fmoviesunblocked.net";
 
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
