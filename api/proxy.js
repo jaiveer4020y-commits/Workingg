@@ -13,9 +13,8 @@ export const config = {
 // CONFIG
 // ═══════════════════════════════════════════════
 
-const REFERER = "https://movibox.net/movies/toxic-hindi-cYFUyAtPk68?id=6800165531384434648&type=/movie/detail&detailSe=&detailEp=&lang=en/";
-const ORIGIN = "https://movibox.net/movies/toxic-hindi-cYFUyAtPk68?id=6800165531384434648&type=/movie/detail&detailSe=&detailEp=&lang=en";
-
+const REFERER = "https://laika422mon.com/";
+const ORIGIN = "https://laika422mon.com";
 const USER_AGENT =
   "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 
