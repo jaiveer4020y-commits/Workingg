@@ -1,19 +1,21 @@
-// /api/proxy.js
+// /api/proxy.js  (v3)
 //
-// Accepts BOTH forms:
-//   1) Properly encoded:
-//      /api/proxy?url=<encodeURIComponent("https://cdn/x.mp4?sign=1&t=2|Referer=...&Origin=...")>
-//   2) Un-encoded (what your screenshot shows):
-//      /api/proxy?url=https://cdn/x.mp4?sign=1&t=2|Referer=https://site/&Origin=https://site
+// HEADER TRANSPORT (any of these, later ones override earlier ones):
+//   1) pipe   : ?url=<enc("https://cdn/x.mp4?sign=1&t=2|Referer=...&Cookie=...")>
+//   2) b64    : ?url=<enc("https://cdn/x.mp4?sign=1&t=2")>&headers=<base64url(JSON)>
+//               (recommended: cookies / ; = & never break parsing)
+//   3) raw    : ?url=https://cdn/x.mp4?sign=1&t=2|Referer=...&Origin=...   (un-encoded)
 //
-// Form 2 used to break because req.query splits on every "&", so
-// "t=2|Referer=..." became its own query param and was then appended
-// to the upstream URL (corrupting the signed "t"), while the headers
-// never reached the CDN (Referer: null in your logs -> 429).
-// We now read the RAW query string instead of req.query.
+// UPSTREAM PROFILES on 403/426 (tried in order, first non-403/426 wins):
+//   as-given -> +accept-encoding -> minimal (referer/ua/cookie) -> ua-only
+//
+// DIAGNOSTICS: on any upstream error the response carries
+//   X-Upstream-Status, X-Upstream-Headers (URL-encoded JSON of the CDN's
+//   response headers), X-Upstream-Attempts, so the caller can see WHO rejected it.
 
 import http from "node:http";
 import https from "node:https";
+import zlib from "node:zlib";
 import { URL } from "node:url";
 
 export const config = {
@@ -44,12 +46,13 @@ const HOP_BY_HOP_HEADERS = new Set([
   "proxy-authorization",
 ]);
 
-// Never accepted from the URL header section.
 const BLOCKED_HEADERS = new Set([
   ...HOP_BY_HOP_HEADERS,
   "host",
   "content-length",
 ]);
+
+const SECRET_HEADERS = new Set(["cookie", "authorization"]);
 
 
 // ═══════════════════════════════════════════════
@@ -90,6 +93,9 @@ function cors(res) {
       "Last-Modified",
       "Content-Disposition",
       "Cache-Control",
+      "X-Upstream-Status",
+      "X-Upstream-Headers",
+      "X-Upstream-Attempts",
     ].join(", ")
   );
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
@@ -132,60 +138,100 @@ function pickHeaders(headers, names) {
   return out;
 }
 
+function redact(headers) {
+  return Object.fromEntries(
+    Object.entries(headers).map(([k, v]) => [
+      k,
+      SECRET_HEADERS.has(k.toLowerCase()) ? "[PRESENT]" : v,
+    ])
+  );
+}
 
-// ═══════════════════════════════════════════════
-// READ THE RAW `url` PARAMETER
-//
-// Do NOT use req.query.url: it is cut at the first
-// unencoded "&", which destroys un-encoded URLs.
-// ═══════════════════════════════════════════════
+// Validate + normalise a header object coming from the URL.
+function sanitizeHeaders(obj) {
+  const headers = {};
 
-function readRawUrlParam(req) {
-  const full = String(req.url || "");
-  const q = full.indexOf("?");
+  for (const [rawName, rawValue] of Object.entries(obj || {})) {
+    const name = String(rawName).trim();
 
-  if (q === -1) {
-    return { raw: "", format: "" };
+    if (!name || !validHeaderName(name)) continue;
+    if (BLOCKED_HEADERS.has(name.toLowerCase())) continue;
+    if (rawValue === null || rawValue === undefined) continue;
+    if (typeof rawValue === "object") continue;
+
+    const value = String(rawValue);
+
+    if (/[\r\n]/.test(value)) continue; // header injection guard
+
+    headers[name] = value;
   }
 
-  let qs = full.slice(q + 1);
-  let format = "";
-
-  // Optional trailing "&format=json"
-  const trailing = qs.match(/&format=([a-z]+)$/i);
-  if (trailing) {
-    format = trailing[1].toLowerCase();
-    qs = qs.slice(0, trailing.index);
-  }
-
-  const m = qs.match(/(?:^|&)url=/);
-  if (!m) {
-    return { raw: "", format };
-  }
-
-  // Optional leading "format=json&url=..."
-  const before = qs.slice(0, m.index);
-  const leading = before.match(/(?:^|&)format=([a-z]+)/i);
-  if (leading) format = leading[1].toLowerCase();
-
-  // EVERYTHING after "url=" belongs to the target + pipe headers.
-  const raw = qs.slice(m.index + m[0].length);
-
-  return { raw, format };
+  return headers;
 }
 
 
 // ═══════════════════════════════════════════════
-// NORMALIZE VALUE
-//
-// Encoded form  : https%3A%2F%2F...%7CReferer%3D...  -> decode ONCE
-// Un-encoded    : https://...|Referer=...            -> leave alone
+// READ RAW QUERY (req.query splits on every "&")
 // ═══════════════════════════════════════════════
+
+function readRawParams(req) {
+  const full = String(req.url || "");
+  const q = full.indexOf("?");
+
+  const out = { raw: "", format: "", headersParam: "" };
+
+  if (q === -1) return out;
+
+  const qs = full.slice(q + 1);
+
+  const m = qs.match(/(?:^|&)url=/);
+  if (!m) return out;
+
+  const before = qs.slice(0, m.index);
+  let rest = qs.slice(m.index + m[0].length);
+
+  // Trailing params that belong to the proxy, not to the target URL.
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+
+    for (const name of ["headers", "format"]) {
+      const re = new RegExp(`&${name}=([^&]*)$`, "i");
+      const mm = rest.match(re);
+
+      if (mm) {
+        if (name === "headers") out.headersParam = mm[1];
+        else out.format = mm[1].toLowerCase();
+
+        rest = rest.slice(0, mm.index);
+        changed = true;
+      }
+    }
+  }
+
+  // Leading params: ?headers=...&url=...
+  for (const part of before.split("&")) {
+    if (!part) continue;
+
+    const eq = part.indexOf("=");
+    const key = eq === -1 ? part : part.slice(0, eq);
+    const val = eq === -1 ? "" : part.slice(eq + 1);
+
+    if (key === "headers") out.headersParam = val;
+    if (key === "format") out.format = val.toLowerCase();
+  }
+
+  out.raw = rest;
+
+  return out;
+}
+
 
 function normalizeValue(raw) {
   let value = String(raw || "").trim();
 
-  // Fully encoded (handles accidental double-encoding too).
+  // Fully encoded (also handles accidental double-encoding).
   for (let i = 0; i < 2 && /^https?%3A/i.test(value); i++) {
     value = safeDecode(value);
   }
@@ -200,15 +246,59 @@ function normalizeValue(raw) {
 
 
 // ═══════════════════════════════════════════════
-// PARSE TARGET + PIPE HEADERS
-//
-//   <target>|Name=Value&Name2=Value2
-//
-// Each header value is percent-decoded INDIVIDUALLY, after
-// splitting on "&" and the first "=". (Decoding the whole
-// header string first turns %26 / %3D inside a value into
-// real "&" / "=" and corrupts cookies.)
+// PARSE TARGET + HEADERS
 // ═══════════════════════════════════════════════
+
+function parsePipeHeaders(headerString) {
+  const obj = {};
+
+  for (const part of headerString.split("&")) {
+    if (!part) continue;
+
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+
+    // Each name/value decoded INDIVIDUALLY, after splitting.
+    const name = safeDecode(part.slice(0, eq)).trim();
+    const val = safeDecode(part.slice(eq + 1));
+
+    if (name) obj[name] = val;
+  }
+
+  return sanitizeHeaders(obj);
+}
+
+
+function parseHeadersParam(param) {
+  if (!param) return {};
+
+  let parsed = null;
+
+  // base64url (or plain base64) JSON
+  try {
+    parsed = JSON.parse(
+      Buffer.from(safeDecode(param), "base64url").toString("utf8")
+    );
+  } catch {
+    parsed = null;
+  }
+
+  // plain URL-encoded JSON
+  if (!parsed) {
+    try {
+      parsed = JSON.parse(safeDecode(param));
+    } catch {
+      parsed = null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+
+  return sanitizeHeaders(parsed);
+}
+
 
 function parseTargetAndHeaders(value) {
   if (!value) {
@@ -222,7 +312,6 @@ function parseTargetAndHeaders(value) {
 
   targetString = targetString.trim();
 
-  // Only decode the target if it is not already a plain URL.
   if (!/^https?:\/\//i.test(targetString)) {
     targetString = safeDecode(targetString);
   }
@@ -233,42 +322,29 @@ function parseTargetAndHeaders(value) {
     throw new Error("Only HTTP/HTTPS URLs are allowed");
   }
 
-  const headers = {};
-
-  for (const part of headerString.split("&")) {
-    if (!part) continue;
-
-    const eq = part.indexOf("=");
-    if (eq === -1) continue;
-
-    const name = safeDecode(part.slice(0, eq)).trim();
-    const val = safeDecode(part.slice(eq + 1));
-
-    if (!name || !validHeaderName(name)) continue;
-    if (BLOCKED_HEADERS.has(name.toLowerCase())) continue;
-    if (/[\r\n]/.test(val)) continue; // header injection guard
-
-    headers[name] = val;
-  }
-
-  return { target, headers };
+  return {
+    target,
+    headers: parsePipeHeaders(headerString),
+  };
 }
 
 
 function getTarget(req) {
-  const { raw, format } = readRawUrlParam(req);
+  const { raw, format, headersParam } = readRawParams(req);
+
   const parsed = parseTargetAndHeaders(normalizeValue(raw));
 
   return {
     target: parsed.target,
-    headers: parsed.headers,
+    // pipe first, then the explicit headers= param overrides it
+    headers: { ...parsed.headers, ...parseHeadersParam(headersParam) },
     format,
   };
 }
 
 
 // ═══════════════════════════════════════════════
-// PROXY URL BUILDERS (for playlist rewriting)
+// PLAYLIST REWRITING (uses the b64 header transport)
 // ═══════════════════════════════════════════════
 
 function proxyBase(req) {
@@ -282,33 +358,22 @@ function proxyBase(req) {
 }
 
 function buildProxyUrl(proxy, absolute, headers) {
-  let value = absolute;
-  const pairs = [];
+  const clean = sanitizeHeaders(headers);
 
-  for (const [name, headerValue] of Object.entries(headers)) {
-    const lower = name.toLowerCase();
+  let out = proxy + encodeURIComponent(absolute);
 
-    if (!headerValue || BLOCKED_HEADERS.has(lower)) continue;
-
-    pairs.push(`${name}=${encodeURIComponent(String(headerValue))}`);
+  if (Object.keys(clean).length) {
+    out +=
+      "&headers=" +
+      Buffer.from(JSON.stringify(clean)).toString("base64url");
   }
 
-  if (pairs.length) {
-    value += "|" + pairs.join("&");
-  }
-
-  return proxy + encodeURIComponent(value);
+  return out;
 }
-
-
-// ═══════════════════════════════════════════════
-// REWRITE M3U8
-// ═══════════════════════════════════════════════
 
 function rewritePlaylist(text, playlistUrl, proxy, headers) {
   const base = new URL("./", playlistUrl).href;
 
-  // URI="..." (KEY, MAP, MEDIA, PART, ...)
   text = text.replace(/URI="([^"]+)"/g, (match, uri) => {
     try {
       const absolute = new URL(uri, base).href;
@@ -318,7 +383,6 @@ function rewritePlaylist(text, playlistUrl, proxy, headers) {
     }
   });
 
-  // Segment / playlist lines
   const lines = text.split(/\r?\n/);
 
   for (let i = 0; i < lines.length; i++) {
@@ -362,7 +426,7 @@ function isVtt(target, contentType) {
 
 
 // ═══════════════════════════════════════════════
-// COPY RESPONSE HEADERS
+// RESPONSE HELPERS
 // ═══════════════════════════════════════════════
 
 function copyHeaders(upstream, res) {
@@ -370,6 +434,7 @@ function copyHeaders(upstream, res) {
     "content-type",
     "content-length",
     "content-range",
+    "content-encoding",
     "accept-ranges",
     "etag",
     "last-modified",
@@ -381,6 +446,46 @@ function copyHeaders(upstream, res) {
     const value = upstream.headers[name];
     if (value !== undefined) res.setHeader(name, value);
   }
+}
+
+// Text bodies (playlists / VTT / errors) must be decompressed first.
+function decodedStream(upstream) {
+  const enc = String(upstream.headers["content-encoding"] || "").toLowerCase();
+
+  if (enc.includes("gzip")) return upstream.pipe(zlib.createGunzip());
+  if (enc.includes("deflate")) return upstream.pipe(zlib.createInflate());
+  if (enc.includes("br")) return upstream.pipe(zlib.createBrotliDecompress());
+
+  return upstream;
+}
+
+async function readText(upstream, limit = Infinity) {
+  const stream = decodedStream(upstream);
+  let body = "";
+
+  stream.setEncoding("utf8");
+
+  try {
+    for await (const chunk of stream) {
+      body += chunk;
+
+      if (body.length >= limit) {
+        stream.destroy();
+        upstream.destroy();
+        break;
+      }
+    }
+  } catch {
+    // truncated / undecodable body: return what we have
+  }
+
+  return body;
+}
+
+function upstreamDiagnostics(upstream) {
+  // Response headers from the CDN: who answered and why.
+  const json = JSON.stringify(upstream.headers);
+  return encodeURIComponent(json.length > 3500 ? json.slice(0, 3500) : json);
 }
 
 
@@ -427,7 +532,6 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
       headers["Accept-Encoding"] = "identity";
     }
 
-    // Node supplies Host itself; strip anything hop-by-hop.
     for (const key of Object.keys(headers)) {
       const lower = key.toLowerCase();
       if (lower === "host" || HOP_BY_HOP_HEADERS.has(lower)) {
@@ -435,14 +539,8 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
       }
     }
 
-    console.log("[UPSTREAM HEADERS]", {
-      referer: getHeader(headers, "referer") ?? null,
-      origin: getHeader(headers, "origin") ?? null,
-      userAgent: getHeader(headers, "user-agent") ?? null,
-      accept: getHeader(headers, "accept") ?? null,
-      range: getHeader(headers, "range") ?? null,
-      cookie: hasHeader(headers, "cookie") ? "[PRESENT]" : null,
-    });
+    // Log EVERY header we send (secrets redacted).
+    console.log("[UPSTREAM HEADERS]", redact(headers));
 
     const options = {
       protocol: target.protocol,
@@ -456,7 +554,6 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
     };
 
     const upstream = transport.request(options, (response) => {
-      // Manual redirect
       if (
         response.statusCode >= 300 &&
         response.statusCode < 400 &&
@@ -486,24 +583,35 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
 
 
 // ═══════════════════════════════════════════════
-// READ A BOUNDED TEXT BODY
+// HEADER PROFILES (tried on 403 / 426)
 // ═══════════════════════════════════════════════
 
-async function readText(stream, limit = Infinity) {
-  let body = "";
+function buildAttempts(headers) {
+  const attempts = [{ name: "as-given", headers }];
 
-  stream.setEncoding("utf8");
-
-  for await (const chunk of stream) {
-    body += chunk;
-
-    if (body.length >= limit) {
-      stream.destroy();
-      break;
-    }
+  if (!hasHeader(headers, "accept-encoding")) {
+    attempts.push({
+      name: "+accept-encoding",
+      headers: { ...headers, "Accept-Encoding": "gzip, deflate" },
+    });
   }
 
-  return body;
+  const count = Object.keys(headers).length;
+
+  const minimal = pickHeaders(headers, ["referer", "user-agent", "cookie"]);
+  if (Object.keys(minimal).length && Object.keys(minimal).length < count) {
+    attempts.push({ name: "minimal", headers: minimal });
+  }
+
+  const uaOnly = pickHeaders(headers, ["user-agent", "cookie"]);
+  if (
+    Object.keys(uaOnly).length &&
+    Object.keys(uaOnly).length < Object.keys(minimal).length
+  ) {
+    attempts.push({ name: "ua-only", headers: uaOnly });
+  }
+
+  return attempts;
 }
 
 
@@ -527,37 +635,27 @@ export default async function handler(req, res) {
     const { target, headers: requestHeaders, format } = getTarget(req);
 
     console.log(`[PROXY] ${req.method} ${target.href}`);
+    console.log("[PROXY REQUEST HEADERS]", redact(requestHeaders));
 
-    console.log(
-      "[PROXY REQUEST HEADERS]",
-      Object.fromEntries(
-        Object.entries(requestHeaders).map(([k, v]) => [
-          k,
-          k.toLowerCase() === "cookie" ? "[PRESENT]" : v,
-        ])
-      )
-    );
+    const attempts = buildAttempts(requestHeaders);
+    const attemptLog = [];
 
-    let result = await requestUpstream(target, requestHeaders, req);
+    let result = null;
 
-    // Some CDNs reject extra headers (e.g. Origin) on media requests.
-    // One retry with the minimal set before giving up.
-    const firstStatus = result.response.statusCode;
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i];
 
-    if (firstStatus === 403 || firstStatus === 426) {
-      const minimal = pickHeaders(requestHeaders, [
-        "referer",
-        "user-agent",
-        "cookie",
-      ]);
+      result = await requestUpstream(target, attempt.headers, req);
 
-      if (
-        Object.keys(minimal).length &&
-        Object.keys(minimal).length < Object.keys(requestHeaders).length
-      ) {
-        console.log(`[RETRY] ${firstStatus} -> minimal headers`);
+      const st = result.response.statusCode;
+
+      attemptLog.push(`${attempt.name}:${st}`);
+
+      if (st !== 403 && st !== 426) break;
+
+      if (i < attempts.length - 1) {
+        console.log(`[RETRY] ${st} with '${attempt.name}' -> next profile`);
         result.response.resume();
-        result = await requestUpstream(target, minimal, req);
       }
     }
 
@@ -568,14 +666,19 @@ export default async function handler(req, res) {
     const contentType = String(upstream.headers["content-type"] || "");
 
     console.log(`[UPSTREAM ${status}] ${finalTarget.href}`);
+    console.log("[UPSTREAM RESPONSE HEADERS]", upstream.headers);
 
-    // ─── Errors: pass through, never cache ───
+    // ─── Errors: pass through, never cache, expose diagnostics ───
     if (status !== 200 && status !== 206 && status !== 304) {
       const body = await readText(upstream, 10000);
+
+      console.log("[UPSTREAM ERROR BODY]", body.slice(0, 500));
 
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.setHeader("X-Upstream-Status", String(status));
+      res.setHeader("X-Upstream-Headers", upstreamDiagnostics(upstream));
+      res.setHeader("X-Upstream-Attempts", attemptLog.join(","));
 
       return res.status(status).send(body);
     }
@@ -621,12 +724,13 @@ export default async function handler(req, res) {
     // ─── Media (MP4 / M4S / TS / AAC / KEY ...) ───
     copyHeaders(upstream, res);
 
-    res.statusCode = status; // 200 stays 200, 206 stays 206
+    res.statusCode = status;
 
     if (!upstream.headers["cache-control"]) {
       res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=3600");
     }
 
+    res.setHeader("X-Upstream-Attempts", attemptLog.join(","));
     res.setHeader("X-Accel-Buffering", "no");
 
     if (req.method === "HEAD") {
@@ -634,7 +738,6 @@ export default async function handler(req, res) {
       return res.end();
     }
 
-    // Stop the upstream download if the client goes away.
     req.on("close", () => {
       if (!res.writableEnded) upstream.destroy();
     });
