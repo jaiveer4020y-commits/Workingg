@@ -1,21 +1,25 @@
-// /api/proxy.js  (v3)
+// /api/proxy.js  (v4)
 //
-// HEADER TRANSPORT (any of these, later ones override earlier ones):
-//   1) pipe   : ?url=<enc("https://cdn/x.mp4?sign=1&t=2|Referer=...&Cookie=...")>
-//   2) b64    : ?url=<enc("https://cdn/x.mp4?sign=1&t=2")>&headers=<base64url(JSON)>
-//               (recommended: cookies / ; = & never break parsing)
-//   3) raw    : ?url=https://cdn/x.mp4?sign=1&t=2|Referer=...&Origin=...   (un-encoded)
+// USAGE
+//   /api/proxy?url=<encodeURIComponent(streamUrl)>&headers=<headers>
 //
-// UPSTREAM PROFILES on 403/426 (tried in order, first non-403/426 wins):
-//   as-given -> +accept-encoding -> minimal (referer/ua/cookie) -> ua-only
+// <headers> can be ANY of:
+//   - URL-encoded JSON        {"Referer":"...","Origin":"..."}
+//   - base64 / base64url JSON (best for cookies and values containing & ; =)
+//   - or pipe style inside url:  ?url=<enc("https://cdn/x.mp4?a=1|Referer=<enc>&Origin=<enc>")>
 //
-// DIAGNOSTICS: on any upstream error the response carries
-//   X-Upstream-Status, X-Upstream-Headers (URL-encoded JSON of the CDN's
-//   response headers), X-Upstream-Attempts, so the caller can see WHO rejected it.
+// SUPPORTS: MP4 / WebM / MKV (Range seeking), HLS (.m3u8, rewritten),
+//           DASH (.mpd, rewritten), TS / M4S segments, VTT, extension-less URLs (sniffed).
+//
+// DEBUG: add &debug=1 to get a JSON report of exactly which headers were sent
+//        upstream and what the CDN answered. Every response also carries
+//        X-Proxy-Header-Names (names only) so you can confirm headers arrived.
 
 import http from "node:http";
 import https from "node:https";
 import zlib from "node:zlib";
+import dns from "node:dns";
+import net from "node:net";
 import { URL } from "node:url";
 
 export const config = {
@@ -29,6 +33,9 @@ export const config = {
 
 const MAX_REDIRECTS = 5;
 const UPSTREAM_TIMEOUT = 20000;
+const TEXT_LIMIT = 5 * 1024 * 1024;
+const SNIFF_LIMIT = 2 * 1024 * 1024;
+const ALLOW_PRIVATE = process.env.ALLOW_PRIVATE === "1"; // tests only
 
 const DEFAULT_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
@@ -53,6 +60,72 @@ const BLOCKED_HEADERS = new Set([
 ]);
 
 const SECRET_HEADERS = new Set(["cookie", "authorization"]);
+
+const MIME_BY_EXT = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  m4s: "video/mp4",
+  webm: "video/webm",
+  mkv: "video/x-matroska",
+  mov: "video/quicktime",
+  ts: "video/mp2t",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  mp3: "audio/mpeg",
+  ogg: "audio/ogg",
+  mpd: "application/dash+xml",
+  m3u8: "application/vnd.apple.mpegurl",
+  vtt: "text/vtt",
+};
+
+const MEDIA_EXT = new Set([
+  "mp4", "m4v", "m4s", "webm", "mkv", "mov", "ts", "m4a", "aac", "mp3", "ogg",
+  "flv", "avi", "mts", "m2ts", "cmfv", "cmfa", "jpg", "jpeg", "png", "webp", "key",
+]);
+
+
+// ═══════════════════════════════════════════════
+// SSRF GUARD (blocks localhost / private ranges / cloud metadata)
+// ═══════════════════════════════════════════════
+
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split(".").map(Number);
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    );
+  }
+
+  if (net.isIPv6(ip)) {
+    const l = ip.toLowerCase();
+    if (l === "::1" || l === "::") return true;
+    if (l.startsWith("fc") || l.startsWith("fd") || l.startsWith("fe80")) return true;
+    if (l.startsWith("::ffff:")) return isPrivateIp(l.slice(7));
+    return false;
+  }
+
+  return true;
+}
+
+function safeLookup(hostname, options, callback) {
+  dns.lookup(hostname, options, (err, address, family) => {
+    if (err) return callback(err);
+
+    const list = Array.isArray(address) ? address : [{ address, family }];
+
+    if (!ALLOW_PRIVATE && list.some((a) => isPrivateIp(a.address))) {
+      return callback(new Error("Blocked private address"));
+    }
+
+    callback(null, address, family);
+  });
+}
 
 
 // ═══════════════════════════════════════════════
@@ -96,6 +169,7 @@ function cors(res) {
       "X-Upstream-Status",
       "X-Upstream-Headers",
       "X-Upstream-Attempts",
+      "X-Proxy-Header-Names",
     ].join(", ")
   );
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
@@ -110,6 +184,11 @@ function validHeaderName(name) {
   return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name);
 }
 
+// Node throws ERR_INVALID_CHAR on anything outside this set.
+function validHeaderValue(value) {
+  return !/[^\t\x20-\x7e\x80-\xff]/.test(value);
+}
+
 function safeDecode(value) {
   try {
     return decodeURIComponent(value);
@@ -118,16 +197,16 @@ function safeDecode(value) {
   }
 }
 
-function getHeader(headers, name) {
+function hasHeader(headers, name) {
   const lower = name.toLowerCase();
-  for (const key of Object.keys(headers)) {
-    if (key.toLowerCase() === lower) return headers[key];
-  }
-  return undefined;
+  return Object.keys(headers).some((k) => k.toLowerCase() === lower);
 }
 
-function hasHeader(headers, name) {
-  return getHeader(headers, name) !== undefined;
+function deleteHeader(headers, name) {
+  const lower = name.toLowerCase();
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === lower) delete headers[k];
+  }
 }
 
 function pickHeaders(headers, names) {
@@ -147,26 +226,51 @@ function redact(headers) {
   );
 }
 
-// Validate + normalise a header object coming from the URL.
-function sanitizeHeaders(obj) {
-  const headers = {};
+function extOf(target) {
+  const m = target.pathname.toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : "";
+}
 
-  for (const [rawName, rawValue] of Object.entries(obj || {})) {
-    const name = String(rawName).trim();
+// Validate + normalise + de-duplicate (case-insensitive, later wins).
+function sanitizeHeaders(...sources) {
+  const map = new Map();
 
-    if (!name || !validHeaderName(name)) continue;
-    if (BLOCKED_HEADERS.has(name.toLowerCase())) continue;
-    if (rawValue === null || rawValue === undefined) continue;
-    if (typeof rawValue === "object") continue;
+  for (const obj of sources) {
+    for (const [rawName, rawValue] of Object.entries(obj || {})) {
+      const name = String(rawName).trim();
+      const lower = name.toLowerCase();
 
-    const value = String(rawValue);
+      if (!name || !validHeaderName(name)) continue;
+      if (BLOCKED_HEADERS.has(lower)) continue;
+      if (rawValue === null || rawValue === undefined) continue;
+      if (typeof rawValue === "object") continue;
 
-    if (/[\r\n]/.test(value)) continue; // header injection guard
+      const value = String(rawValue).trim();
 
-    headers[name] = value;
+      if (/[\r\n]/.test(value)) continue; // header injection guard
+      if (!validHeaderValue(value)) continue;
+
+      map.set(lower, [name, value]);
+    }
   }
 
-  return headers;
+  const out = {};
+  for (const [name, value] of map.values()) out[name] = value;
+  return out;
+}
+
+function sendJson(res, status, obj) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.end(JSON.stringify(obj, null, 2));
+}
+
+function sendText(res, status, type, body, cache) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", type);
+  res.setHeader("Cache-Control", cache);
+  res.end(body);
 }
 
 
@@ -178,7 +282,7 @@ function readRawParams(req) {
   const full = String(req.url || "");
   const q = full.indexOf("?");
 
-  const out = { raw: "", format: "", headersParam: "" };
+  const out = { raw: "", format: "", headersParam: "", debug: false };
 
   if (q === -1) return out;
 
@@ -190,20 +294,23 @@ function readRawParams(req) {
   const before = qs.slice(0, m.index);
   let rest = qs.slice(m.index + m[0].length);
 
+  const assign = (name, val) => {
+    if (name === "headers") out.headersParam = val;
+    else if (name === "format") out.format = val.toLowerCase();
+    else if (name === "debug") out.debug = val !== "" && val !== "0" && val !== "false";
+  };
+
   // Trailing params that belong to the proxy, not to the target URL.
   let changed = true;
 
   while (changed) {
     changed = false;
 
-    for (const name of ["headers", "format"]) {
-      const re = new RegExp(`&${name}=([^&]*)$`, "i");
-      const mm = rest.match(re);
+    for (const name of ["headers", "format", "debug"]) {
+      const mm = rest.match(new RegExp(`&${name}=([^&]*)$`, "i"));
 
       if (mm) {
-        if (name === "headers") out.headersParam = mm[1];
-        else out.format = mm[1].toLowerCase();
-
+        assign(name, mm[1]);
         rest = rest.slice(0, mm.index);
         changed = true;
       }
@@ -215,18 +322,16 @@ function readRawParams(req) {
     if (!part) continue;
 
     const eq = part.indexOf("=");
-    const key = eq === -1 ? part : part.slice(0, eq);
+    const key = (eq === -1 ? part : part.slice(0, eq)).toLowerCase();
     const val = eq === -1 ? "" : part.slice(eq + 1);
 
-    if (key === "headers") out.headersParam = val;
-    if (key === "format") out.format = val.toLowerCase();
+    assign(key, val);
   }
 
   out.raw = rest;
 
   return out;
 }
-
 
 function normalizeValue(raw) {
   let value = String(raw || "").trim();
@@ -265,28 +370,33 @@ function parsePipeHeaders(headerString) {
     if (name) obj[name] = val;
   }
 
-  return sanitizeHeaders(obj);
+  return obj;
 }
-
 
 function parseHeadersParam(param) {
   if (!param) return {};
 
+  const decoded = safeDecode(param).trim();
   let parsed = null;
 
-  // base64url (or plain base64) JSON
-  try {
-    parsed = JSON.parse(
-      Buffer.from(safeDecode(param), "base64url").toString("utf8")
-    );
-  } catch {
-    parsed = null;
+  // 1) JSON (URL-encoded)
+  if (decoded.startsWith("{")) {
+    try {
+      parsed = JSON.parse(decoded);
+    } catch {
+      parsed = null;
+    }
   }
 
-  // plain URL-encoded JSON
+  // 2) base64 / base64url JSON
   if (!parsed) {
     try {
-      parsed = JSON.parse(safeDecode(param));
+      const text = Buffer.from(
+        decoded.replace(/-/g, "+").replace(/_/g, "/"),
+        "base64"
+      ).toString("utf8");
+
+      if (text.trim().startsWith("{")) parsed = JSON.parse(text);
     } catch {
       parsed = null;
     }
@@ -296,9 +406,8 @@ function parseHeadersParam(param) {
     return {};
   }
 
-  return sanitizeHeaders(parsed);
+  return parsed;
 }
-
 
 function parseTargetAndHeaders(value) {
   if (!value) {
@@ -322,65 +431,84 @@ function parseTargetAndHeaders(value) {
     throw new Error("Only HTTP/HTTPS URLs are allowed");
   }
 
-  return {
-    target,
-    headers: parsePipeHeaders(headerString),
-  };
+  return { target, pipeHeaders: parsePipeHeaders(headerString) };
 }
-
 
 function getTarget(req) {
-  const { raw, format, headersParam } = readRawParams(req);
+  const { raw, format, headersParam, debug } = readRawParams(req);
 
-  const parsed = parseTargetAndHeaders(normalizeValue(raw));
+  const { target, pipeHeaders } = parseTargetAndHeaders(normalizeValue(raw));
 
   return {
-    target: parsed.target,
+    target,
     // pipe first, then the explicit headers= param overrides it
-    headers: { ...parsed.headers, ...parseHeadersParam(headersParam) },
+    headers: sanitizeHeaders(pipeHeaders, parseHeadersParam(headersParam)),
     format,
+    debug,
   };
 }
 
 
 // ═══════════════════════════════════════════════
-// PLAYLIST REWRITING (uses the b64 header transport)
+// PROXY URL BUILDING (used when rewriting playlists)
 // ═══════════════════════════════════════════════
 
-function proxyBase(req) {
+function proxyRoot(req) {
   const proto = String(req.headers["x-forwarded-proto"] || "https")
     .split(",")[0]
     .trim();
 
   const host = req.headers["x-forwarded-host"] || req.headers.host;
 
-  return `${proto}://${host}/api/proxy?url=`;
-}
-
-function buildProxyUrl(proxy, absolute, headers) {
-  const clean = sanitizeHeaders(headers);
-
-  let out = proxy + encodeURIComponent(absolute);
-
-  if (Object.keys(clean).length) {
-    out +=
-      "&headers=" +
-      Buffer.from(JSON.stringify(clean)).toString("base64url");
+  let path = "/api/proxy";
+  try {
+    path = new URL(req.url, "http://x").pathname || path;
+  } catch {
+    // keep default
   }
 
-  return out;
+  return `${proto}://${host}${path}`;
 }
 
-function rewritePlaylist(text, playlistUrl, proxy, headers) {
-  const base = new URL("./", playlistUrl).href;
+// Keeps DASH placeholders ($Number$, $Time$, $RepresentationID$ ...) readable so
+// the player can substitute them before requesting the segment.
+function encodeTarget(absolute) {
+  return encodeURIComponent(absolute).replace(
+    /%24(?:RepresentationID|Number|Bandwidth|Time|SubNumber)(?:%25\d*d)?%24/g,
+    (m) => decodeURIComponent(m)
+  );
+}
 
-  text = text.replace(/URI="([^"]+)"/g, (match, uri) => {
+function buildProxyUrl(root, absolute, headers) {
+  const clean = sanitizeHeaders(headers);
+
+  const h = Object.keys(clean).length
+    ? "headers=" + Buffer.from(JSON.stringify(clean)).toString("base64url") + "&"
+    : "";
+
+  // headers FIRST, url LAST (url may contain unencoded $Placeholders$).
+  return `${root}?${h}url=${encodeTarget(absolute)}`;
+}
+
+
+// ═══════════════════════════════════════════════
+// PLAYLIST REWRITING
+// ═══════════════════════════════════════════════
+
+function rewriteHls(text, playlistUrl, root, headers) {
+  const wrap = (ref) => {
+    if (/^data:/i.test(ref)) return null;
     try {
-      const absolute = new URL(uri, base).href;
-      return `URI="${buildProxyUrl(proxy, absolute, headers)}"`;
+      return buildProxyUrl(root, new URL(ref, playlistUrl).href, headers);
     } catch {
-      return match;
+      return null;
     }
+  };
+
+  // Tag attributes: EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, EXT-X-PART, ...
+  text = text.replace(/URI="([^"]+)"/g, (match, uri) => {
+    const out = wrap(uri);
+    return out ? `URI="${out}"` : match;
   });
 
   const lines = text.split(/\r?\n/);
@@ -390,37 +518,59 @@ function rewritePlaylist(text, playlistUrl, proxy, headers) {
 
     if (!line || line.startsWith("#")) continue;
 
-    try {
-      const absolute = new URL(line, base).href;
-      lines[i] = buildProxyUrl(proxy, absolute, headers);
-    } catch {
-      // keep original
-    }
+    const out = wrap(line);
+    if (out) lines[i] = out;
   }
 
   return lines.join("\n");
 }
 
+function rewriteMpd(text, manifestUrl, root, headers) {
+  const unesc = (s) => s.replace(/&amp;/g, "&");
+  const esc = (s) => s.replace(/&/g, "&amp;");
+  const wrap = (abs) => esc(buildProxyUrl(root, abs, headers));
 
-// ═══════════════════════════════════════════════
-// DETECTORS
-// ═══════════════════════════════════════════════
+  const usesTemplates = /<SegmentTemplate[\s>]|<SegmentList[\s>]/.test(text);
 
-function isPlaylist(target, contentType) {
-  const path = target.pathname.toLowerCase();
-  const type = contentType.toLowerCase();
+  if (usesTemplates) {
+    // Segment URLs are relative to the (first) BaseURL, or the manifest itself.
+    let base = manifestUrl;
 
-  return (
-    path.endsWith(".m3u8") ||
-    path.endsWith(".m3u") ||
-    type.includes("mpegurl")
-  );
-}
+    const first = text.match(/<BaseURL[^>]*>([\s\S]*?)<\/BaseURL>/);
+    if (first) {
+      try {
+        base = new URL(unesc(first[1].trim()), manifestUrl).href;
+      } catch {
+        // keep manifest url
+      }
+    }
 
-function isVtt(target, contentType) {
-  return (
-    target.pathname.toLowerCase().endsWith(".vtt") ||
-    contentType.toLowerCase().includes("text/vtt")
+    text = text.replace(/<BaseURL[^>]*>[\s\S]*?<\/BaseURL>/g, "");
+
+    text = text.replace(
+      /\b(initialization|media|index|sourceURL|bitstreamSwitching)="([^"]*)"/g,
+      (m, attr, val) => {
+        try {
+          return `${attr}="${wrap(new URL(unesc(val), base).href)}"`;
+        } catch {
+          return m;
+        }
+      }
+    );
+
+    return text;
+  }
+
+  // On-demand profile: BaseURL IS the media file.
+  return text.replace(
+    /(<BaseURL[^>]*>)([\s\S]*?)(<\/BaseURL>)/g,
+    (m, open, val, close) => {
+      try {
+        return `${open}${wrap(new URL(unesc(val.trim()), manifestUrl).href)}${close}`;
+      } catch {
+        return m;
+      }
+    }
   );
 }
 
@@ -429,7 +579,7 @@ function isVtt(target, contentType) {
 // RESPONSE HELPERS
 // ═══════════════════════════════════════════════
 
-function copyHeaders(upstream, res) {
+function copyHeaders(upstream, res, target) {
   const allowed = [
     "content-type",
     "content-length",
@@ -446,6 +596,14 @@ function copyHeaders(upstream, res) {
     const value = upstream.headers[name];
     if (value !== undefined) res.setHeader(name, value);
   }
+
+  // Players refuse to play some CDN responses labelled octet-stream / missing.
+  const type = String(upstream.headers["content-type"] || "").toLowerCase();
+
+  if (!type || type.includes("octet-stream")) {
+    const guess = MIME_BY_EXT[extOf(target)];
+    if (guess) res.setHeader("content-type", guess);
+  }
 }
 
 // Text bodies (playlists / VTT / errors) must be decompressed first.
@@ -459,17 +617,17 @@ function decodedStream(upstream) {
   return upstream;
 }
 
-async function readText(upstream, limit = Infinity) {
+async function readBuffer(upstream, limit) {
   const stream = decodedStream(upstream);
-  let body = "";
-
-  stream.setEncoding("utf8");
+  const chunks = [];
+  let size = 0;
 
   try {
     for await (const chunk of stream) {
-      body += chunk;
+      chunks.push(chunk);
+      size += chunk.length;
 
-      if (body.length >= limit) {
+      if (size >= limit) {
         stream.destroy();
         upstream.destroy();
         break;
@@ -479,11 +637,10 @@ async function readText(upstream, limit = Infinity) {
     // truncated / undecodable body: return what we have
   }
 
-  return body;
+  return Buffer.concat(chunks);
 }
 
 function upstreamDiagnostics(upstream) {
-  // Response headers from the CDN: who answered and why.
   const json = JSON.stringify(upstream.headers);
   return encodeURIComponent(json.length > 3500 ? json.slice(0, 3500) : json);
 }
@@ -500,17 +657,22 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
       return;
     }
 
+    const hostname = target.hostname.replace(/^\[|\]$/g, "");
+
+    if (!ALLOW_PRIVATE && net.isIP(hostname) && isPrivateIp(hostname)) {
+      reject(new Error("Blocked private address"));
+      return;
+    }
+
     const isHttps = target.protocol === "https:";
     const transport = isHttps ? https : http;
     const agent = isHttps ? httpsAgent : httpAgent;
 
     const headers = { ...requestHeaders };
 
-    // Range comes from the player (needed for seeking).
+    // Range comes from the player (needed for seeking) and wins over any preset.
     if (req.headers.range) {
-      for (const k of Object.keys(headers)) {
-        if (k.toLowerCase() === "range") delete headers[k];
-      }
+      deleteHeader(headers, "range");
       headers.Range = req.headers.range;
     }
 
@@ -539,17 +701,17 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
       }
     }
 
-    // Log EVERY header we send (secrets redacted).
-    console.log("[UPSTREAM HEADERS]", redact(headers));
+    console.log("[UPSTREAM HEADERS]", target.host, redact(headers));
 
     const options = {
       protocol: target.protocol,
-      hostname: target.hostname,
+      hostname,
       port: target.port || (isHttps ? 443 : 80),
       path: target.pathname + target.search,
       method: req.method,
       headers,
       agent,
+      lookup: safeLookup,
       timeout: UPSTREAM_TIMEOUT,
     };
 
@@ -559,13 +721,34 @@ function requestUpstream(target, requestHeaders, req, redirects = 0) {
         response.statusCode < 400 &&
         response.headers.location
       ) {
-        const redirected = new URL(response.headers.location, target);
-
         response.resume();
 
-        return requestUpstream(redirected, requestHeaders, req, redirects + 1)
+        let redirected;
+        try {
+          redirected = new URL(response.headers.location, target);
+          if (redirected.protocol !== "http:" && redirected.protocol !== "https:") {
+            throw new Error("Bad redirect protocol");
+          }
+        } catch (err) {
+          reject(err);
+          return;
+        }
+
+        // Never leak cookies / auth to a different host.
+        let nextHeaders = requestHeaders;
+        if (redirected.host !== target.host) {
+          nextHeaders = Object.fromEntries(
+            Object.entries(requestHeaders).filter(
+              ([k]) => !SECRET_HEADERS.has(k.toLowerCase())
+            )
+          );
+        }
+
+        requestUpstream(redirected, nextHeaders, req, redirects + 1)
           .then(resolve)
           .catch(reject);
+
+        return;
       }
 
       resolve({ response, target });
@@ -623,19 +806,30 @@ export default async function handler(req, res) {
   cors(res);
 
   if (req.method === "OPTIONS") {
-    return res.status(204).end();
+    res.statusCode = 204;
+    return res.end();
   }
 
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.setHeader("Allow", "GET, HEAD, OPTIONS");
-    return res.status(405).json({ error: "Method not allowed" });
+    return sendJson(res, 405, { error: "Method not allowed" });
   }
 
-  try {
-    const { target, headers: requestHeaders, format } = getTarget(req);
+  let parsed;
 
+  try {
+    parsed = getTarget(req);
+  } catch (error) {
+    return sendJson(res, 400, { error: error?.message || "Bad request" });
+  }
+
+  const { target, headers: requestHeaders, format, debug } = parsed;
+
+  try {
     console.log(`[PROXY] ${req.method} ${target.href}`);
     console.log("[PROXY REQUEST HEADERS]", redact(requestHeaders));
+
+    res.setHeader("X-Proxy-Header-Names", Object.keys(requestHeaders).join(","));
 
     const attempts = buildAttempts(requestHeaders);
     const attemptLog = [];
@@ -649,7 +843,12 @@ export default async function handler(req, res) {
 
       const st = result.response.statusCode;
 
-      attemptLog.push(`${attempt.name}:${st}`);
+      attemptLog.push({
+        name: attempt.name,
+        status: st,
+        sent: Object.keys(attempt.headers),
+        responseHeaders: result.response.headers,
+      });
 
       if (st !== 403 && st !== 426) break;
 
@@ -662,67 +861,105 @@ export default async function handler(req, res) {
     const upstream = result.response;
     const finalTarget = result.target;
     const status = upstream.statusCode || 500;
-
     const contentType = String(upstream.headers["content-type"] || "");
+    const ct = contentType.toLowerCase();
+    const attemptsText = attemptLog.map((a) => `${a.name}:${a.status}`).join(",");
 
     console.log(`[UPSTREAM ${status}] ${finalTarget.href}`);
-    console.log("[UPSTREAM RESPONSE HEADERS]", upstream.headers);
+
+    // ─── Debug report ───
+    if (debug) {
+      upstream.resume();
+
+      return sendJson(res, 200, {
+        target: target.href,
+        finalTarget: finalTarget.href,
+        headersReceivedByProxy: redact(requestHeaders),
+        attempts: attemptLog.map((a) => ({
+          profile: a.name,
+          status: a.status,
+          headerNamesSent: a.sent,
+          cdnResponseHeaders: a.responseHeaders,
+        })),
+      });
+    }
 
     // ─── Errors: pass through, never cache, expose diagnostics ───
     if (status !== 200 && status !== 206 && status !== 304) {
-      const body = await readText(upstream, 10000);
+      const body = (await readBuffer(upstream, 10000)).toString("utf8");
 
       console.log("[UPSTREAM ERROR BODY]", body.slice(0, 500));
 
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.setHeader("X-Upstream-Status", String(status));
       res.setHeader("X-Upstream-Headers", upstreamDiagnostics(upstream));
-      res.setHeader("X-Upstream-Attempts", attemptLog.join(","));
+      res.setHeader("X-Upstream-Attempts", attemptsText);
 
-      return res.status(status).send(body);
+      return sendText(res, status, "text/plain; charset=utf-8", body, "no-store");
     }
 
-    // ─── M3U8 ───
-    if (isPlaylist(finalTarget, contentType)) {
-      const body = await readText(upstream);
+    // ─── What kind of body is this? ───
+    const ext = extOf(finalTarget);
+    const declaredLen = Number(upstream.headers["content-length"] || 0);
 
-      const rewritten = rewritePlaylist(
-        body,
-        finalTarget.href,
-        proxyBase(req),
-        requestHeaders
-      );
+    let kind = "";
+    if (ext === "m3u8" || ext === "m3u" || ct.includes("mpegurl")) kind = "hls";
+    else if (ext === "mpd" || ct.includes("dash+xml")) kind = "dash";
+    else if (ext === "vtt" || ct.includes("text/vtt")) kind = "vtt";
 
-      res.statusCode = status === 206 ? 206 : 200;
+    const knownMedia = /^(video|audio|image)\//.test(ct) || MEDIA_EXT.has(ext);
+    const textish = !ct || /^text\/|json|xml/.test(ct);
+    const smallBinary =
+      ct.includes("octet-stream") && declaredLen > 0 && declaredLen <= SNIFF_LIMIT;
 
-      res.setHeader(
-        "Cache-Control",
-        "public, max-age=2, s-maxage=2, stale-while-revalidate=3"
-      );
+    const sniff =
+      !kind &&
+      req.method === "GET" &&
+      status === 200 &&
+      !knownMedia &&
+      (textish || smallBinary);
 
-      if (format === "json") {
-        res.setHeader("Content-Type", "application/json");
-        return res.end(JSON.stringify({ content: rewritten }));
+    if (kind || sniff) {
+      const buf = await readBuffer(upstream, TEXT_LIMIT);
+      const text = buf.toString("utf8");
+
+      if (sniff) {
+        if (text.trimStart().startsWith("#EXTM3U")) kind = "hls";
+        else if (/<MPD[\s>]/.test(text.slice(0, 4096))) kind = "dash";
+        else if (text.startsWith("WEBVTT")) kind = "vtt";
       }
 
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      return res.end(rewritten);
-    }
+      const root = proxyRoot(req);
 
-    // ─── VTT ───
-    if (isVtt(finalTarget, contentType)) {
-      const body = await readText(upstream);
+      if (kind === "hls") {
+        const out = rewriteHls(text, finalTarget.href, root, requestHeaders);
+        const cache = "public, max-age=2, s-maxage=2, stale-while-revalidate=3";
 
+        if (format === "json") {
+          return sendText(res, 200, "application/json", JSON.stringify({ content: out }), cache);
+        }
+
+        return sendText(res, 200, "application/vnd.apple.mpegurl", out, cache);
+      }
+
+      if (kind === "dash") {
+        const out = rewriteMpd(text, finalTarget.href, root, requestHeaders);
+        return sendText(res, 200, "application/dash+xml", out, "public, max-age=2, s-maxage=2");
+      }
+
+      if (kind === "vtt") {
+        return sendText(res, status, "text/vtt; charset=utf-8", text, "public, max-age=300, s-maxage=300");
+      }
+
+      // Sniffed, but just an ordinary small file: send the decoded bytes as-is.
       res.statusCode = status;
-      res.setHeader("Content-Type", "text/vtt; charset=utf-8");
+      if (contentType) res.setHeader("Content-Type", contentType);
       res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
-
-      return res.end(body);
+      res.setHeader("Content-Length", String(buf.length));
+      return res.end(buf);
     }
 
-    // ─── Media (MP4 / M4S / TS / AAC / KEY ...) ───
-    copyHeaders(upstream, res);
+    // ─── Media (MP4 / WebM / MKV / M4S / TS / AAC / KEY ...) ───
+    copyHeaders(upstream, res, finalTarget);
 
     res.statusCode = status;
 
@@ -730,7 +967,7 @@ export default async function handler(req, res) {
       res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=3600");
     }
 
-    res.setHeader("X-Upstream-Attempts", attemptLog.join(","));
+    res.setHeader("X-Upstream-Attempts", attemptsText);
     res.setHeader("X-Accel-Buffering", "no");
 
     if (req.method === "HEAD") {
@@ -752,9 +989,7 @@ export default async function handler(req, res) {
     console.error("[PROXY ERROR]", error);
 
     if (!res.headersSent) {
-      return res
-        .status(502)
-        .json({ error: error?.message || "Bad gateway" });
+      return sendJson(res, 502, { error: error?.message || "Bad gateway" });
     }
 
     try {
