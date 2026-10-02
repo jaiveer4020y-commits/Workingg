@@ -1,7 +1,16 @@
-// /api/proxy.js  (v5 — Vercel Edge Runtime, working version)
+// /api/proxy.js  (v6 — Vercel Edge Runtime, multi-audio support)
 //
 // USAGE
 //   /api/proxy?url=<encodeURIComponent(streamUrl)>&headers=<headers>
+//
+// MULTI-AUDIO (muxed MPEG-TS with several audio streams)
+//   /api/proxy?url=<enc(media.m3u8)>&headers=<headers>&mode=master
+//     -> returns a MASTER playlist with one #EXT-X-MEDIA audio entry per
+//        audio stream found in the first segment (hls.js / Video.js / Shaka
+//        will show an audio selector).
+//   Each entry points back here with &track=a0, a1, ... and the video with
+//   &track=v. Segments requested with &track=... are filtered on the fly
+//   (only the chosen PIDs are kept, PMT rewritten).
 //
 // <headers> can be:
 //   - URL-encoded JSON        {"Referer":"...","Origin":"..."}
@@ -26,6 +35,16 @@ const MAX_REDIRECTS = 5;
 const UPSTREAM_TIMEOUT = 25000;
 const TEXT_LIMIT = 5 * 1024 * 1024;
 const SNIFF_LIMIT = 2 * 1024 * 1024;
+const PROBE_BYTES = 128 * 1024;      // how much of the first segment to read for PAT/PMT
+const MASTER_BANDWIDTH = 3000000;    // advertised bandwidth in generated master
+
+const LANG_NAMES = {
+  hin: "Hindi", tam: "Tamil", tel: "Telugu", kan: "Kannada", mal: "Malayalam",
+  eng: "English", ben: "Bengali", mar: "Marathi", guj: "Gujarati", pan: "Punjabi",
+  urd: "Urdu", spa: "Spanish", fra: "French", fre: "French", deu: "German",
+  ger: "German", jpn: "Japanese", kor: "Korean", zho: "Chinese", chi: "Chinese",
+  rus: "Russian", ara: "Arabic", por: "Portuguese", ita: "Italian",
+};
 
 const DEFAULT_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
@@ -95,6 +114,7 @@ function corsHeaders() {
       "X-Upstream-Status",
       "X-Upstream-Attempts",
       "X-Proxy-Header-Names",
+      "X-Proxy-Track",
     ].join(", "),
     "Cross-Origin-Resource-Policy": "cross-origin",
   };
@@ -218,7 +238,9 @@ function b64urlEncode(str) {
 // ═══════════════════════════════════════════════
 
 function readRawParams(rawUrl) {
-  const out = { raw: "", format: "", headersParam: "", debug: false };
+  const out = {
+    raw: "", format: "", headersParam: "", debug: false, track: "", mode: "",
+  };
 
   const q = rawUrl.indexOf("?");
   if (q === -1) return out;
@@ -233,13 +255,15 @@ function readRawParams(rawUrl) {
   const assign = (name, val) => {
     if (name === "headers") out.headersParam = val;
     else if (name === "format") out.format = val.toLowerCase();
+    else if (name === "track") out.track = val.toLowerCase();
+    else if (name === "mode") out.mode = val.toLowerCase();
     else if (name === "debug") out.debug = val !== "" && val !== "0" && val !== "false";
   };
 
   let changed = true;
   while (changed) {
     changed = false;
-    for (const name of ["headers", "format", "debug"]) {
+    for (const name of ["headers", "format", "debug", "track", "mode"]) {
       const mm = rest.match(new RegExp(`&${name}=([^&]*)$`, "i"));
       if (mm) {
         assign(name, mm[1]);
@@ -344,7 +368,7 @@ function parseTargetAndHeaders(value) {
 }
 
 function getTarget(reqUrl) {
-  const { raw, format, headersParam, debug } = readRawParams(reqUrl);
+  const { raw, format, headersParam, debug, track, mode } = readRawParams(reqUrl);
 
   const { target, pipeHeaders } = parseTargetAndHeaders(normalizeValue(raw));
 
@@ -353,6 +377,8 @@ function getTarget(reqUrl) {
     headers: sanitizeHeaders(pipeHeaders, parseHeadersParam(headersParam)),
     format,
     debug,
+    track: /^(v|a\d{1,2})$/.test(track) ? track : "",
+    mode,
   };
 }
 
@@ -376,14 +402,15 @@ function encodeTarget(absolute) {
   );
 }
 
-function buildProxyUrl(root, absolute, headers) {
+function buildProxyUrl(root, absolute, headers, track) {
   const clean = sanitizeHeaders(headers);
 
   const h = Object.keys(clean).length
     ? "headers=" + b64urlEncode(JSON.stringify(clean)) + "&"
     : "";
+  const t = track ? `track=${track}&` : "";
 
-  return `${root}?${h}url=${encodeTarget(absolute)}`;
+  return `${root}?${h}${t}url=${encodeTarget(absolute)}`;
 }
 
 
@@ -391,18 +418,24 @@ function buildProxyUrl(root, absolute, headers) {
 // PLAYLIST REWRITING
 // ═══════════════════════════════════════════════
 
-function rewriteHls(text, playlistUrl, root, headers) {
-  const wrap = (ref) => {
+// `track` is appended to media segment URLs only (not to keys / init maps).
+function rewriteHls(text, playlistUrl, root, headers, track) {
+  const wrap = (ref, withTrack) => {
     if (/^data:/i.test(ref)) return null;
     try {
-      return buildProxyUrl(root, new URL(ref, playlistUrl).href, headers);
+      return buildProxyUrl(
+        root,
+        new URL(ref, playlistUrl).href,
+        headers,
+        withTrack ? track : ""
+      );
     } catch {
       return null;
     }
   };
 
   text = text.replace(/URI="([^"]+)"/g, (match, uri) => {
-    const out = wrap(uri);
+    const out = wrap(uri, false);
     return out ? `URI="${out}"` : match;
   });
 
@@ -411,7 +444,7 @@ function rewriteHls(text, playlistUrl, root, headers) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line || line.startsWith("#")) continue;
-    const out = wrap(line);
+    const out = wrap(line, true);
     if (out) lines[i] = out;
   }
 
@@ -463,6 +496,320 @@ function rewriteMpd(text, manifestUrl, root, headers) {
       }
     }
   );
+}
+
+
+// ═══════════════════════════════════════════════
+// MPEG-TS: PAT / PMT PARSING, PID FILTER
+// ═══════════════════════════════════════════════
+
+const TS = 188;
+
+const VIDEO_TYPES = new Set([0x01, 0x02, 0x10, 0x1b, 0x24]);
+const AUDIO_TYPES = new Set([0x03, 0x04, 0x0f, 0x11, 0x81, 0x87]);
+const AUDIO_DESC_TAGS = [0x6a, 0x7a, 0x7c, 0x81];
+
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+function crc32mpeg(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = (crc ^ (bytes[i] << 24)) >>> 0;
+    for (let j = 0; j < 8; j++) {
+      crc = crc & 0x80000000 ? ((crc << 1) ^ 0x04c11db7) >>> 0 : (crc << 1) >>> 0;
+    }
+  }
+  return crc >>> 0;
+}
+
+function findSync(b) {
+  for (let i = 0; i + TS * 2 < b.length; i++) {
+    if (b[i] === 0x47 && b[i + TS] === 0x47 && b[i + 2 * TS] === 0x47) return i;
+  }
+  return -1;
+}
+
+// Offset of the payload inside a TS packet, or -1.
+function tsPayloadOffset(pkt) {
+  const afc = (pkt[3] >> 4) & 3;
+  if (afc === 0 || afc === 2) return -1;
+  let o = 4;
+  if (afc === 3) o += 1 + pkt[4];
+  return o >= TS ? -1 : o;
+}
+
+// Start of the PSI section in a payload-unit-start packet, or -1.
+function sectionStart(pkt) {
+  const o = tsPayloadOffset(pkt);
+  if (o < 0) return -1;
+  const s = o + 1 + pkt[o];
+  return s < TS - 3 ? s : -1;
+}
+
+function readPat(pkt) {
+  const s = sectionStart(pkt);
+  if (s < 0 || pkt[s] !== 0x00) return -1;
+  const secLen = ((pkt[s + 1] & 0x0f) << 8) | pkt[s + 2];
+  const end = Math.min(s + 3 + secLen - 4, TS);
+  for (let i = s + 8; i + 4 <= end; i += 4) {
+    const prog = (pkt[i] << 8) | pkt[i + 1];
+    if (prog !== 0) return ((pkt[i + 2] & 0x1f) << 8) | pkt[i + 3];
+  }
+  return -1;
+}
+
+function scanDescriptors(desc) {
+  let lang = "";
+  const tags = new Set();
+  for (let i = 0; i + 2 <= desc.length; ) {
+    const tag = desc[i];
+    const len = desc[i + 1];
+    tags.add(tag);
+    if (tag === 0x0a && len >= 3 && i + 5 <= desc.length) {
+      lang = String.fromCharCode(desc[i + 2], desc[i + 3], desc[i + 4]).toLowerCase();
+    }
+    i += 2 + len;
+  }
+  return { lang, tags };
+}
+
+function classifyStream(type, tags) {
+  if (VIDEO_TYPES.has(type)) return "video";
+  if (AUDIO_TYPES.has(type)) return "audio";
+  if (type === 0x06 && AUDIO_DESC_TAGS.some((t) => tags.has(t))) return "audio";
+  return "other";
+}
+
+// Parses a single-packet PMT section. Returns null if it does not fit one packet.
+function readPmt(pkt) {
+  const s = sectionStart(pkt);
+  if (s < 0 || pkt[s] !== 0x02) return null;
+  const secLen = ((pkt[s + 1] & 0x0f) << 8) | pkt[s + 2];
+  if (s + 3 + secLen > TS) return null;
+
+  const end = s + 3 + secLen - 4;
+  const pcrPid = ((pkt[s + 8] & 0x1f) << 8) | pkt[s + 9];
+  const progLen = ((pkt[s + 10] & 0x0f) << 8) | pkt[s + 11];
+  const progInfo = pkt.slice(s + 12, s + 12 + progLen);
+
+  const streams = [];
+  let i = s + 12 + progLen;
+  while (i + 5 <= end) {
+    const type = pkt[i];
+    const pid = ((pkt[i + 1] & 0x1f) << 8) | pkt[i + 2];
+    const esLen = ((pkt[i + 3] & 0x0f) << 8) | pkt[i + 4];
+    const desc = pkt.slice(i + 5, i + 5 + esLen);
+    const { lang, tags } = scanDescriptors(desc);
+    streams.push({ type, pid, desc, lang, kind: classifyStream(type, tags) });
+    i += 5 + esLen;
+  }
+
+  return { pcrPid, progInfo, streams, secHead: pkt.slice(s + 3, s + 8) };
+}
+
+function parsePsi(bytes) {
+  const start = findSync(bytes);
+  if (start < 0) return null;
+
+  let pmtPid = -1;
+  for (let p = start; p + TS <= bytes.length; p += TS) {
+    const pkt = bytes.subarray(p, p + TS);
+    if (pkt[0] !== 0x47) break;
+    if (!(pkt[1] & 0x40)) continue;
+    const pid = ((pkt[1] & 0x1f) << 8) | pkt[2];
+
+    if (pid === 0 && pmtPid < 0) {
+      pmtPid = readPat(pkt);
+    } else if (pmtPid >= 0 && pid === pmtPid) {
+      const info = readPmt(pkt);
+      if (info) return { ...info, pmtPid };
+    }
+  }
+  return null;
+}
+
+function chooseKeep(info, track) {
+  const videos = info.streams.filter((s) => s.kind === "video");
+  const audios = info.streams.filter((s) => s.kind === "audio");
+
+  if (track === "v") return new Set(videos.map((s) => s.pid));
+
+  const a = audios[Number(track.slice(1))];
+  return a ? new Set([a.pid]) : new Set();
+}
+
+function buildPmtPacket(orig, info, keep, pcrPid) {
+  const body = [];
+  for (const st of info.streams) {
+    if (!keep.has(st.pid)) continue;
+    body.push(
+      st.type,
+      0xe0 | (st.pid >> 8),
+      st.pid & 0xff,
+      0xf0 | (st.desc.length >> 8),
+      st.desc.length & 0xff,
+      ...st.desc
+    );
+  }
+
+  const sec = [
+    0x02, 0, 0,
+    ...info.secHead,                       // program number, version, section numbers
+    0xe0 | (pcrPid >> 8), pcrPid & 0xff,
+    0xf0 | (info.progInfo.length >> 8), info.progInfo.length & 0xff,
+    ...info.progInfo,
+    ...body,
+  ];
+
+  const secLen = sec.length - 3 + 4;       // + CRC
+  sec[1] = 0xb0 | (secLen >> 8);
+  sec[2] = secLen & 0xff;
+
+  const crc = crc32mpeg(sec);
+  sec.push((crc >>> 24) & 0xff, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff);
+
+  if (5 + sec.length > TS) return null;
+
+  const out = new Uint8Array(TS).fill(0xff);
+  out[0] = 0x47;
+  out[1] = orig[1];
+  out[2] = orig[2];
+  out[3] = (orig[3] & 0x0f) | 0x10;        // payload only, keep continuity counter
+  out[4] = 0x00;                           // pointer_field
+  out.set(sec, 5);
+  return out;
+}
+
+// Streaming filter: keeps PAT + rewritten PMT + only the chosen elementary streams.
+// If the body does not start with a TS sync byte it is passed through untouched.
+function makeTsFilter(track) {
+  let carry = new Uint8Array(0);
+  let started = false;
+  let passthrough = false;
+  let pmtPid = -1;
+  let info = null;
+  let keep = null;
+
+  const handle = (pkt) => {
+    const pid = ((pkt[1] & 0x1f) << 8) | pkt[2];
+    const pusi = (pkt[1] & 0x40) !== 0;
+
+    if (pid === 0) {
+      if (pmtPid < 0 && pusi) pmtPid = readPat(pkt);
+      return pkt;
+    }
+
+    if (pmtPid >= 0 && pid === pmtPid) {
+      if (!pusi) return info ? null : pkt;
+      const parsed = readPmt(pkt);
+      if (!parsed) return pkt;
+      info = parsed;
+      keep = chooseKeep(info, track);
+      const first = keep.values().next();
+      const pcr = keep.has(info.pcrPid)
+        ? info.pcrPid
+        : first.done ? 0x1fff : first.value;
+      return buildPmtPacket(pkt, info, keep, pcr) || pkt;
+    }
+
+    return keep && keep.has(pid) ? pkt : null;
+  };
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      const buf = carry.length ? concatBytes(carry, chunk) : chunk;
+      carry = new Uint8Array(0);
+
+      if (!started) {
+        if (!buf.length) return;
+        started = true;
+        passthrough = buf[0] !== 0x47;
+      }
+
+      if (passthrough) {
+        controller.enqueue(buf);
+        return;
+      }
+
+      const out = new Uint8Array(buf.length);
+      let w = 0;
+      let p = 0;
+
+      while (p + TS <= buf.length) {
+        if (buf[p] !== 0x47) { p++; continue; }
+        const r = handle(buf.subarray(p, p + TS));
+        if (r) {
+          out.set(r, w);
+          w += TS;
+        }
+        p += TS;
+      }
+
+      carry = buf.slice(p);
+      if (w) controller.enqueue(out.subarray(0, w));
+    },
+  });
+}
+
+
+// ═══════════════════════════════════════════════
+// MASTER PLAYLIST GENERATION
+// ═══════════════════════════════════════════════
+
+async function probeTracks(playlistText, playlistUrl, requestHeaders) {
+  const first = playlistText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith("#"));
+  if (!first) return { audio: [], video: [] };
+
+  const segUrl = new URL(first, playlistUrl);
+  const headers = buildUpstreamHeaders(requestHeaders, { headers: new Headers() }, true);
+  headers.set("Range", `bytes=0-${PROBE_BYTES - 1}`);
+
+  const { response } = await fetchUpstream(segUrl, headers, { method: "GET" });
+  if (response.status !== 200 && response.status !== 206) {
+    try { response.body?.cancel(); } catch {}
+    return { audio: [], video: [] };
+  }
+
+  const bytes = await readCapped(response, PROBE_BYTES);
+  const psi = parsePsi(bytes);
+  if (!psi) return { audio: [], video: [] };
+
+  return {
+    audio: psi.streams.filter((s) => s.kind === "audio"),
+    video: psi.streams.filter((s) => s.kind === "video"),
+  };
+}
+
+function buildMaster(root, playlistUrl, headers, audio) {
+  const lines = ["#EXTM3U", "#EXT-X-VERSION:3"];
+  const used = new Set();
+
+  audio.forEach((t, i) => {
+    const lang = t.lang || "und";
+    let name = LANG_NAMES[lang] || (t.lang ? t.lang.toUpperCase() : `Audio ${i + 1}`);
+    if (used.has(name)) name = `${name} ${i + 1}`;
+    used.add(name);
+
+    const uri = buildProxyUrl(root, playlistUrl, headers, `a${i}`);
+    const flag = i === 0 ? "YES" : "NO";
+    lines.push(
+      `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="${name}",LANGUAGE="${lang}",` +
+      `DEFAULT=${flag},AUTOSELECT=${flag},URI="${uri}"`
+    );
+  });
+
+  lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${MASTER_BANDWIDTH},AUDIO="aud"`);
+  lines.push(buildProxyUrl(root, playlistUrl, headers, "v"));
+
+  return lines.join("\n") + "\n";
 }
 
 
@@ -540,7 +887,9 @@ function upstreamDiagnostics(upstream) {
 // REQUEST UPSTREAM
 // ═══════════════════════════════════════════════
 
-function buildUpstreamHeaders(requestHeaders, req) {
+// skipRange: do not forward the client's Range header (used for filtered TS,
+// whose size differs from the upstream file).
+function buildUpstreamHeaders(requestHeaders, req, skipRange = false) {
   const headers = new Headers();
 
   for (const [k, v] of Object.entries(requestHeaders)) {
@@ -549,18 +898,18 @@ function buildUpstreamHeaders(requestHeaders, req) {
   }
 
   const incomingRange = req.headers.get("range");
-  if (incomingRange) {
+  if (incomingRange && !skipRange) {
     headers.delete("range");
     headers.set("Range", incomingRange);
   }
 
   const ifNoneMatch = req.headers.get("if-none-match");
-  if (ifNoneMatch && !headers.has("if-none-match")) {
+  if (ifNoneMatch && !skipRange && !headers.has("if-none-match")) {
     headers.set("If-None-Match", ifNoneMatch);
   }
 
   const ifModifiedSince = req.headers.get("if-modified-since");
-  if (ifModifiedSince && !headers.has("if-modified-since")) {
+  if (ifModifiedSince && !skipRange && !headers.has("if-modified-since")) {
     headers.set("If-Modified-Since", ifModifiedSince);
   }
 
@@ -680,7 +1029,7 @@ export default async function handler(req) {
     return jsonResponse(400, { error: error?.message || "Bad request" });
   }
 
-  const { target, headers: requestHeaders, format, debug } = parsed;
+  const { target, headers: requestHeaders, format, debug, track, mode } = parsed;
 
   try {
     console.log(`[PROXY] ${req.method} ${target.href}`);
@@ -693,7 +1042,7 @@ export default async function handler(req) {
 
     for (let i = 0; i < attempts.length; i++) {
       const attempt = attempts[i];
-      const upstreamHeaders = buildUpstreamHeaders(attempt.headers, req);
+      const upstreamHeaders = buildUpstreamHeaders(attempt.headers, req, Boolean(track));
 
       result = await fetchUpstream(target, upstreamHeaders, req);
 
@@ -800,7 +1149,32 @@ export default async function handler(req) {
       const root = proxyRoot(reqUrl);
 
       if (kind === "hls") {
-        const out = rewriteHls(text, finalTarget.href, root, requestHeaders);
+        // ─── Multi-audio: build a master playlist from the muxed TS ───
+        if (mode === "master" && !/#EXT-X-STREAM-INF/.test(text)) {
+          let tracks = { audio: [], video: [] };
+          try {
+            tracks = await probeTracks(text, finalTarget, requestHeaders);
+          } catch (err) {
+            console.error("[PROBE ERROR]", err);
+          }
+
+          if (tracks.audio.length < 2) {
+            return jsonResponse(422, {
+              error: "Could not find multiple audio streams in the first segment",
+              audioStreamsFound: tracks.audio.length,
+              hint: "Segments may be encrypted / fMP4, or the probe request was blocked.",
+            });
+          }
+
+          return textResponse(
+            200,
+            "application/vnd.apple.mpegurl",
+            buildMaster(root, finalTarget.href, requestHeaders, tracks.audio),
+            "no-store"
+          );
+        }
+
+        const out = rewriteHls(text, finalTarget.href, root, requestHeaders, track);
         const cache = "public, max-age=2, s-maxage=2, stale-while-revalidate=3";
 
         if (format === "json") {
@@ -842,6 +1216,21 @@ export default async function handler(req) {
           ...(ct ? { "Content-Type": ct } : {}),
           "Cache-Control": "public, max-age=300, s-maxage=300",
           "Content-Length": String(buf.length),
+        },
+      });
+    }
+
+    // ─── Per-track filtered TS segment (video-only or one audio stream) ───
+    if (track && req.method === "GET" && status === 200 && upstream.body) {
+      const filtered = upstream.body.pipeThrough(makeTsFilter(track));
+      return new Response(filtered, {
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": "video/mp2t",
+          "Cache-Control": "public, max-age=3600, s-maxage=3600",
+          "X-Proxy-Track": track,
+          "X-Upstream-Attempts": attemptsText,
         },
       });
     }
