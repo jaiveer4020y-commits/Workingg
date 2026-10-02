@@ -8,6 +8,8 @@
 //     -> returns a MASTER playlist with one #EXT-X-MEDIA audio entry per
 //        audio stream found in the first segment (hls.js / Video.js / Shaka
 //        will show an audio selector).
+//   Add &format=text to any playlist URL to view it as plain text in a browser
+//   instead of downloading it as a .m3u file.
 //   Each entry points back here with &track=a0, a1, ... and the video with
 //   &track=v. Segments requested with &track=... are filtered on the fly
 //   (only the chosen PIDs are kept, PMT rewritten).
@@ -1168,7 +1170,9 @@ export default async function handler(req) {
 
           return textResponse(
             200,
-            "application/vnd.apple.mpegurl",
+            format === "text"
+              ? "text/plain; charset=utf-8"
+              : "application/vnd.apple.mpegurl",
             buildMaster(root, finalTarget.href, requestHeaders, tracks.audio),
             "no-store"
           );
@@ -1186,7 +1190,14 @@ export default async function handler(req) {
           );
         }
 
-        return textResponse(200, "application/vnd.apple.mpegurl", out, cache);
+        return textResponse(
+          200,
+          format === "text"
+            ? "text/plain; charset=utf-8"
+            : "application/vnd.apple.mpegurl",
+          out,
+          cache
+        );
       }
 
       if (kind === "dash") {
