@@ -1,4 +1,4 @@
-// /api/proxy.js  (v6.1 — Vercel Edge Runtime, formatted master playlist output)
+// /api/proxy.js (Vercel Edge Runtime - Media & Range Request Optimized)
 
 export const config = {
   runtime: "edge",
@@ -34,10 +34,11 @@ const DEFAULT_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
+// "content-length" removed to preserve range response headers for video players
 const BLOCKED_HEADERS = new Set([
   "connection", "proxy-connection", "keep-alive", "transfer-encoding",
   "upgrade", "te", "trailer", "proxy-authenticate", "proxy-authorization",
-  "host", "content-length",
+  "host",
 ]);
 
 const SECRET_HEADERS = new Set(["cookie", "authorization"]);
@@ -537,6 +538,16 @@ export default async function handler(req) {
     for (const [k, v] of Object.entries(requestHeaders)) upstreamHeaders.set(k, v);
     if (!upstreamHeaders.has("user-agent")) upstreamHeaders.set("User-Agent", DEFAULT_UA);
 
+    // Forward Range and If-Range headers from client request if not explicitly set in URL params
+    const clientRange = req.headers.get("range");
+    if (clientRange && !upstreamHeaders.has("range")) {
+      upstreamHeaders.set("Range", clientRange);
+    }
+    const clientIfRange = req.headers.get("if-range");
+    if (clientIfRange && !upstreamHeaders.has("if-range")) {
+      upstreamHeaders.set("If-Range", clientIfRange);
+    }
+
     const upstream = await fetch(target.href, { method: req.method, headers: upstreamHeaders });
     const status = upstream.status;
 
@@ -582,6 +593,22 @@ export default async function handler(req) {
 
     const outHeaders = new Headers(corsHeaders());
     upstream.headers.forEach((v, k) => { if (!BLOCKED_HEADERS.has(k)) outHeaders.set(k, v); });
+
+    // Force inline rendering for video/audio files so browsers do not trigger downloads
+    if (ext && MEDIA_EXT.has(ext)) {
+      outHeaders.set("Content-Disposition", "inline");
+      if (!outHeaders.has("Content-Type") && MIME_BY_EXT[ext]) {
+        outHeaders.set("Content-Type", MIME_BY_EXT[ext]);
+      }
+    } else if (ct.startsWith("video/") || ct.startsWith("audio/")) {
+      outHeaders.set("Content-Disposition", "inline");
+    }
+
+    // Indicate byte-seeking support to browser media engine
+    if (!outHeaders.has("Accept-Ranges")) {
+      outHeaders.set("Accept-Ranges", "bytes");
+    }
+
     return new Response(upstream.body, { status, headers: outHeaders });
   } catch (error) {
     return jsonResponse(502, { error: error?.message || "Bad gateway" });
