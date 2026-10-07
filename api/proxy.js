@@ -77,7 +77,7 @@ function corsHeaders() {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════
 
-function validHeaderName(name) { return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name); }
+function validHeaderName(name) { return /^[!#$\%&'*+\-.^_`\vert{}~0-9A-Za-z]+$/.test(name); }
 function validHeaderValue(value) { return !/[\r\n]/.test(value); }
 function safeDecode(value) { try { return decodeURIComponent(value); } catch { return value; } }
 
@@ -423,27 +423,48 @@ function makeTsFilter(track) {
 
   return new TransformStream({
     transform(chunk, controller) {
-      const buf = carry.length ? new Uint8Array([...carry, ...chunk]) : chunk;
-      carry = new Uint8Array(0);
+      try {
+        let buf;
+        if (carry.length > 0) {
+          buf = new Uint8Array(carry.length + chunk.length);
+          buf.set(carry, 0);
+          buf.set(chunk, carry.length);
+        } else {
+          buf = chunk;
+        }
+        carry = new Uint8Array(0);
 
-      if (!started) {
-        if (!buf.length) return;
-        started = true;
-        passthrough = buf[0] !== 0x47;
+        if (!started) {
+          if (!buf.length) return;
+          started = true;
+          passthrough = buf[0] !== 0x47;
+        }
+
+        if (passthrough) {
+          controller.enqueue(buf);
+          return;
+        }
+
+        const out = new Uint8Array(buf.length);
+        let w = 0, p = 0;
+        while (p + TS <= buf.length) {
+          if (buf[p] !== 0x47) {
+            const nextSync = findSync(buf.subarray(p));
+            if (nextSync === -1) {
+              p = buf.length;
+              break;
+            }
+            p += nextSync;
+          }
+          const r = handle(buf.subarray(p, p + TS));
+          if (r) { out.set(r, w); w += TS; }
+          p += TS;
+        }
+        carry = buf.slice(p);
+        if (w) controller.enqueue(out.subarray(0, w));
+      } catch (err) {
+        controller.enqueue(chunk);
       }
-
-      if (passthrough) { controller.enqueue(buf); return; }
-
-      const out = new Uint8Array(buf.length);
-      let w = 0, p = 0;
-      while (p + TS <= buf.length) {
-        if (buf[p] !== 0x47) { p++; continue; }
-        const r = handle(buf.subarray(p, p + TS));
-        if (r) { out.set(r, w); w += TS; }
-        p += TS;
-      }
-      carry = buf.slice(p);
-      if (w) controller.enqueue(out.subarray(0, w));
     },
   });
 }
@@ -453,39 +474,71 @@ function makeTsFilter(track) {
 // ═══════════════════════════════════════════════
 
 async function probeTracks(playlistText, playlistUrl, requestHeaders) {
-  const first = playlistText.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
+  const first = playlistText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith("#"));
+
   if (!first) return { audio: [], video: [] };
 
-  const headers = new Headers();
-  for (const [k, v] of Object.entries(requestHeaders)) headers.set(k, v);
-  headers.set("Range", `bytes=0-${PROBE_BYTES - 1}`);
-  if (!headers.has("user-agent")) headers.set("User-Agent", DEFAULT_UA);
+  try {
+    const parentUrl = new URL(playlistUrl);
+    const targetSegmentUrl = new URL(first, playlistUrl);
 
-  const res = await fetch(new URL(first, playlistUrl).href, { headers });
-  if (res.status !== 200 && res.status !== 206) return { audio: [], video: [] };
+    // Preserve parent URL query parameters (auth_key, expire, etc.) if absent on relative segment path
+    if (!targetSegmentUrl.search && parentUrl.search) {
+      targetSegmentUrl.search = parentUrl.search;
+    }
 
-  const reader = res.body.getReader();
-  const chunks = [];
-  let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    size += value.length;
-    if (size >= PROBE_BYTES) { try { await reader.cancel(); } catch {} break; }
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(requestHeaders)) headers.set(k, v);
+    headers.set("Range", `bytes=0-${PROBE_BYTES - 1}`);
+    if (!headers.has("user-agent")) headers.set("User-Agent", DEFAULT_UA);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const res = await fetch(targetSegmentUrl.href, {
+      headers,
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
+
+    if ((res.status !== 200 && res.status !== 206) || !res.body) {
+      return { audio: [], video: [] };
+    }
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
+
+    while (size < PROBE_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.length;
+    }
+
+    try {
+      await reader.cancel();
+    } catch {}
+
+    const bytes = new Uint8Array(size);
+    let off = 0;
+    for (const c of chunks) {
+      bytes.set(c, off);
+      off += c.length;
+    }
+
+    const psi = parsePsi(bytes);
+    if (!psi) return { audio: [], video: [] };
+
+    return {
+      audio: psi.streams.filter((s) => s.kind === "audio"),
+      video: psi.streams.filter((s) => s.kind === "video"),
+    };
+  } catch (err) {
+    return { audio: [], video: [] };
   }
-
-  const bytes = new Uint8Array(size);
-  let off = 0;
-  for (const c of chunks) { bytes.set(c, off); off += c.length; }
-
-  const psi = parsePsi(bytes);
-  if (!psi) return { audio: [], video: [] };
-
-  return {
-    audio: psi.streams.filter((s) => s.kind === "audio"),
-    video: psi.streams.filter((s) => s.kind === "video"),
-  };
 }
 
 function buildMaster(root, playlistUrl, headers, audio) {
