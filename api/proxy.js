@@ -12,7 +12,7 @@ const MAX_REDIRECTS = 5;
 const UPSTREAM_TIMEOUT = 25000;
 const TEXT_LIMIT = 5 * 1024 * 1024;
 const SNIFF_LIMIT = 2 * 1024 * 1024;
-const PROBE_BYTES = 128 * 1024;      
+const PROBE_BYTES = 32 * 1024;      // Reduced from 128KB for speed
 const MASTER_BANDWIDTH = 2500000;    
 
 const LANG_NAMES = {
@@ -34,7 +34,6 @@ const DEFAULT_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
-// "content-length" removed to preserve range response headers for video players
 const BLOCKED_HEADERS = new Set([
   "connection", "proxy-connection", "keep-alive", "transfer-encoding",
   "upgrade", "te", "trailer", "proxy-authenticate", "proxy-authorization",
@@ -111,10 +110,15 @@ function jsonResponse(status, obj) {
   });
 }
 
-function textResponse(status, type, body, cache) {
+function textResponse(status, body, cache) {
   return new Response(body, {
     status,
-    headers: { ...corsHeaders(), "Content-Type": type, "Cache-Control": cache },
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Content-Disposition": "inline",
+      "Cache-Control": cache
+    },
   });
 }
 
@@ -392,6 +396,12 @@ function makeTsFilter(track) {
       const audios = info.streams.filter((s) => s.kind === "audio");
       keep = track === "v" ? new Set(videos.map((s) => s.pid)) : new Set([audios[Number(track.slice(1))]?.pid].filter(Boolean));
 
+      // Fallback: if requested track doesn't exist, pass through original stream
+      if (keep.size === 0) {
+          passthrough = true;
+          return pkt;
+      }
+
       const first = keep.values().next();
       const pcr = keep.has(info.pcrPid) ? info.pcrPid : first.done ? 0x1fff : first.value;
 
@@ -423,27 +433,32 @@ function makeTsFilter(track) {
 
   return new TransformStream({
     transform(chunk, controller) {
-      const buf = carry.length ? new Uint8Array([...carry, ...chunk]) : chunk;
-      carry = new Uint8Array(0);
+      try {
+          const buf = carry.length ? new Uint8Array([...carry, ...chunk]) : chunk;
+          carry = new Uint8Array(0);
 
-      if (!started) {
-        if (!buf.length) return;
-        started = true;
-        passthrough = buf[0] !== 0x47;
+          if (!started) {
+            if (!buf.length) return;
+            started = true;
+            passthrough = buf[0] !== 0x47;
+          }
+
+          if (passthrough) { controller.enqueue(buf); return; }
+
+          const out = new Uint8Array(buf.length);
+          let w = 0, p = 0;
+          while (p + TS <= buf.length) {
+            if (buf[p] !== 0x47) { p++; continue; }
+            const r = handle(buf.subarray(p, p + TS));
+            if (r) { out.set(r, w); w += TS; }
+            p += TS;
+          }
+          carry = buf.slice(p);
+          if (w) controller.enqueue(out.subarray(0, w));
+      } catch (e) {
+          // Fallback to raw stream if filter fails
+          controller.enqueue(chunk);
       }
-
-      if (passthrough) { controller.enqueue(buf); return; }
-
-      const out = new Uint8Array(buf.length);
-      let w = 0, p = 0;
-      while (p + TS <= buf.length) {
-        if (buf[p] !== 0x47) { p++; continue; }
-        const r = handle(buf.subarray(p, p + TS));
-        if (r) { out.set(r, w); w += TS; }
-        p += TS;
-      }
-      carry = buf.slice(p);
-      if (w) controller.enqueue(out.subarray(0, w));
     },
   });
 }
@@ -453,39 +468,48 @@ function makeTsFilter(track) {
 // ═══════════════════════════════════════════════
 
 async function probeTracks(playlistText, playlistUrl, requestHeaders) {
-  const first = playlistText.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
-  if (!first) return { audio: [], video: [] };
+  try {
+    const first = playlistText.split(/\r?\n/).map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
+    if (!first) return { audio: [], video: [] };
 
-  const headers = new Headers();
-  for (const [k, v] of Object.entries(requestHeaders)) headers.set(k, v);
-  headers.set("Range", `bytes=0-${PROBE_BYTES - 1}`);
-  if (!headers.has("user-agent")) headers.set("User-Agent", DEFAULT_UA);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout for speed
 
-  const res = await fetch(new URL(first, playlistUrl).href, { headers });
-  if (res.status !== 200 && res.status !== 206) return { audio: [], video: [] };
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(requestHeaders)) headers.set(k, v);
+    headers.set("Range", `bytes=0-${PROBE_BYTES - 1}`);
+    if (!headers.has("user-agent")) headers.set("User-Agent", DEFAULT_UA);
 
-  const reader = res.body.getReader();
-  const chunks = [];
-  let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    size += value.length;
-    if (size >= PROBE_BYTES) { try { await reader.cancel(); } catch {} break; }
+    const res = await fetch(new URL(first, playlistUrl).href, { headers, signal: controller.signal });
+    clearTimeout(timeoutId);
+    
+    if (res.status !== 200 && res.status !== 206) return { audio: [], video: [] };
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.length;
+      if (size >= PROBE_BYTES) { try { await reader.cancel(); } catch {} break; }
+    }
+
+    const bytes = new Uint8Array(size);
+    let off = 0;
+    for (const c of chunks) { bytes.set(c, off); off += c.length; }
+
+    const psi = parsePsi(bytes);
+    if (!psi) return { audio: [], video: [] };
+
+    return {
+      audio: psi.streams.filter((s) => s.kind === "audio"),
+      video: psi.streams.filter((s) => s.kind === "video"),
+    };
+  } catch (e) {
+    return { audio: [], video: [] };
   }
-
-  const bytes = new Uint8Array(size);
-  let off = 0;
-  for (const c of chunks) { bytes.set(c, off); off += c.length; }
-
-  const psi = parsePsi(bytes);
-  if (!psi) return { audio: [], video: [] };
-
-  return {
-    audio: psi.streams.filter((s) => s.kind === "audio"),
-    video: psi.streams.filter((s) => s.kind === "video"),
-  };
 }
 
 function buildMaster(root, playlistUrl, headers, audio) {
@@ -548,7 +572,12 @@ export default async function handler(req) {
       upstreamHeaders.set("If-Range", clientIfRange);
     }
 
-    const upstream = await fetch(target.href, { method: req.method, headers: upstreamHeaders });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
+
+    const upstream = await fetch(target.href, { method: req.method, headers: upstreamHeaders, signal: controller.signal });
+    clearTimeout(timeoutId);
+    
     const status = upstream.status;
 
     if (status !== 200 && status !== 206) {
@@ -564,31 +593,35 @@ export default async function handler(req) {
       const root = proxyRoot(req.url);
 
       if (mode === "master" && !/#EXT-X-STREAM-INF/.test(text)) {
-        const tracks = await probeTracks(text, target.href, requestHeaders);
-        if (tracks.audio.length >= 2) {
-          return textResponse(
-            200,
-            format === "text" ? "text/plain; charset=utf-8" : "application/vnd.apple.mpegurl",
-            buildMaster(root, target.href, requestHeaders, tracks.audio),
-            "no-store"
-          );
+        try {
+          const tracks = await probeTracks(text, target.href, requestHeaders);
+          if (tracks.audio.length >= 2) {
+            return textResponse(200, buildMaster(root, target.href, requestHeaders, tracks.audio), "no-store");
+          }
+        } catch (e) {
+          // Ignore probe errors, fallback to rewriting
         }
       }
 
       const out = rewriteHls(text, target.href, root, requestHeaders, track);
-      return textResponse(
-        200,
-        format === "text" ? "text/plain; charset=utf-8" : "application/vnd.apple.mpegurl",
-        out,
-        "public, max-age=2, s-maxage=2"
-      );
+      return textResponse(200, out, "public, max-age=2, s-maxage=2");
     }
 
     if (track && req.method === "GET" && status === 200 && upstream.body) {
-      return new Response(upstream.body.pipeThrough(makeTsFilter(track)), {
-        status: 200,
-        headers: { ...corsHeaders(), "Content-Type": "video/mp2t", "Cache-Control": "public, max-age=3600" },
-      });
+      try {
+        return new Response(upstream.body.pipeThrough(makeTsFilter(track)), {
+          status: 200,
+          headers: { 
+            ...corsHeaders(), 
+            "Content-Type": "video/mp2t", 
+            "Cache-Control": "public, max-age=3600",
+            "Content-Disposition": "inline"
+          },
+        });
+      } catch (e) {
+        // Fallback to raw stream if filter fails
+        return new Response(upstream.body, { status, headers: corsHeaders() });
+      }
     }
 
     const outHeaders = new Headers(corsHeaders());
@@ -600,8 +633,10 @@ export default async function handler(req) {
       if (!outHeaders.has("Content-Type") && MIME_BY_EXT[ext]) {
         outHeaders.set("Content-Type", MIME_BY_EXT[ext]);
       }
+      outHeaders.set("Cache-Control", "public, max-age=3600");
     } else if (ct.startsWith("video/") || ct.startsWith("audio/")) {
       outHeaders.set("Content-Disposition", "inline");
+      outHeaders.set("Cache-Control", "public, max-age=3600");
     }
 
     // Indicate byte-seeking support to browser media engine
