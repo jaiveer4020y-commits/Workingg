@@ -9,8 +9,8 @@ export const config = {
 // ═══════════════════════════════════════════════
 
 const UPSTREAM_TIMEOUT = 25000;
-const PROBE_TIMEOUT = 4000;
-const PROBE_BYTES = 32 * 1024; // 32KB is enough to parse PAT/PMT headers
+const PROBE_TIMEOUT = 2000; // Strict 2s timeout to prevent Error 1101
+const PROBE_BYTES = 16 * 1024; // 16KB is enough for PAT/PMT headers
 const MASTER_BANDWIDTH = 2500000;
 
 const LANG_NAMES = {
@@ -32,10 +32,11 @@ const DEFAULT_UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
+// CRITICAL: Block these headers from upstream to prevent download prompts and corruption
 const BLOCKED_HEADERS = new Set([
   "connection", "proxy-connection", "keep-alive", "transfer-encoding",
   "upgrade", "te", "trailer", "proxy-authenticate", "proxy-authorization",
-  "host", "content-disposition", "content-type" // We will set these manually
+  "host", "content-disposition", "content-type", "content-encoding"
 ]);
 
 const MIME_BY_EXT = {
@@ -99,18 +100,6 @@ function jsonResponse(status, obj) {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
     headers: { ...corsHeaders(), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
-  });
-}
-
-function textResponse(status, body, cache) {
-  return new Response(body, {
-    status,
-    headers: {
-      ...corsHeaders(),
-      "Content-Type": "application/vnd.apple.mpegurl", // Force native player
-      "Content-Disposition": "inline",                // Prevent download prompt
-      "Cache-Control": cache
-    },
   });
 }
 
@@ -551,6 +540,7 @@ export default async function handler(req) {
     for (const [k, v] of Object.entries(requestHeaders)) upstreamHeaders.set(k, v);
     if (!upstreamHeaders.has("user-agent")) upstreamHeaders.set("User-Agent", DEFAULT_UA);
 
+    // Forward Range headers for seamless seeking
     const clientRange = req.headers.get("range");
     if (clientRange && !upstreamHeaders.has("range")) {
       upstreamHeaders.set("Range", clientRange);
@@ -563,7 +553,13 @@ export default async function handler(req) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
 
-    const upstream = await fetch(target.href, { method: req.method, headers: upstreamHeaders, signal: controller.signal });
+    // Use redirect: "follow" to handle 302s from source servers
+    const upstream = await fetch(target.href, { 
+      method: req.method, 
+      headers: upstreamHeaders, 
+      signal: controller.signal,
+      redirect: "follow"
+    });
     clearTimeout(timeoutId);
     
     const status = upstream.status;
@@ -584,15 +580,31 @@ export default async function handler(req) {
         try {
           const tracks = await probeTracks(text, target.href, requestHeaders);
           if (tracks.audio.length >= 2) {
-            return textResponse(200, buildMaster(root, target.href, requestHeaders, tracks.audio), "no-store");
+            return new Response(buildMaster(root, target.href, requestHeaders, tracks.audio), {
+              status: 200,
+              headers: {
+                ...corsHeaders(),
+                "Content-Type": "application/vnd.apple.mpegurl", // Explicitly force HLS type
+                "Content-Disposition": "inline",                // Prevent download
+                "Cache-Control": "no-store"
+              }
+            });
           }
         } catch (e) {
-          // Fallback to normal rewrite if probe fails
+          // Ignore probe errors, fallback to rewriting
         }
       }
 
       const out = rewriteHls(text, target.href, root, requestHeaders, track);
-      return textResponse(200, out, "public, max-age=2, s-maxage=2");
+      return new Response(out, {
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": "application/vnd.apple.mpegurl", // Explicitly force HLS type
+          "Content-Disposition": "inline",
+          "Cache-Control": "public, max-age=2, s-maxage=2"
+        }
+      });
     }
 
     if (track && req.method === "GET" && status === 200 && upstream.body) {
@@ -613,11 +625,10 @@ export default async function handler(req) {
 
     const outHeaders = new Headers(corsHeaders());
     
-    // Forward safe headers (excluding blocked ones)
+    // Forward safe headers
     upstream.headers.forEach((v, k) => { if (!BLOCKED_HEADERS.has(k)) outHeaders.set(k, v); });
 
-    // --- CRITICAL FIX FOR PLAYBACK ---
-    // Force the correct Content-Type and inline disposition based on extension
+    // Force correct Content-Type and inline disposition based on extension
     if (ext && MEDIA_EXT.has(ext)) {
       outHeaders.set("Content-Disposition", "inline");
       if (MIME_BY_EXT[ext]) {
@@ -629,6 +640,7 @@ export default async function handler(req) {
       outHeaders.set("Cache-Control", "public, max-age=3600");
     }
 
+    // Indicate byte-seeking support to browser media engine
     if (!outHeaders.has("Accept-Ranges")) {
       outHeaders.set("Accept-Ranges", "bytes");
     }
