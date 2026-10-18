@@ -623,7 +623,7 @@ export default async function handler(req) {
   let parsed;
   try { parsed = getTarget(req.url); } catch (e) { return jsonResponse(400, { error: e.message }); }
 
-  const { target, headers: requestHeaders, format, track, mode } = parsed;
+  const { target, headers: requestHeaders, format, debug, track, mode } = parsed;
 
   try {
     const upstreamHeaders = new Headers();
@@ -647,6 +647,18 @@ export default async function handler(req) {
 
     const upstream = await fetchUp(target.href, { method: req.method, headers: upstreamHeaders });
     const status = upstream.status;
+
+    if (debug) {
+      const hdrs = {};
+      upstream.headers.forEach((v, k) => { hdrs[k] = v; });
+      const sent = {};
+      upstreamHeaders.forEach((v, k) => { sent[k] = v; });
+      try { await upstream.body?.cancel(); } catch {}
+      return jsonResponse(200, {
+        target: target.href, upstreamStatus: status, upstreamHeaders: hdrs,
+        sentHeaders: sent, clientRange: req.headers.get("range") || null,
+      });
+    }
 
     if (status !== 200 && status !== 206) {
       const body = req.method === "HEAD" ? null : await upstream.text().catch(() => "");
@@ -717,12 +729,20 @@ export default async function handler(req) {
     // upstream may have been decoded by fetch; a stale encoding header would corrupt playback
     outHeaders.delete("content-encoding");
 
-    if (ext && MEDIA_EXT.has(ext)) {
+    const isMediaFile = (ext && MEDIA_EXT.has(ext)) || ct.startsWith("video/") || ct.startsWith("audio/");
+    if (isMediaFile) {
       outHeaders.set("Content-Disposition", "inline");
-      if (!outHeaders.has("Content-Type") && MIME_BY_EXT[ext]) outHeaders.set("Content-Type", MIME_BY_EXT[ext]);
-      if (status === 200) outHeaders.set("Cache-Control", SEGMENT_CACHE);
-    } else if (ct.startsWith("video/") || ct.startsWith("audio/")) {
-      outHeaders.set("Content-Disposition", "inline");
+      // iOS/Safari refuse to play when the type is octet-stream / text / missing
+      const curCt = String(outHeaders.get("Content-Type") || "").toLowerCase();
+      if (MIME_BY_EXT[ext] && !curCt.startsWith("video/") && !curCt.startsWith("audio/")) {
+        outHeaders.set("Content-Type", MIME_BY_EXT[ext]);
+      }
+      // Only HLS segments are CDN-cached. Never cache whole movie files / Range responses.
+      if (ext === "ts" || ext === "m4s" || ext === "cmfv" || ext === "cmfa") {
+        if (status === 200) outHeaders.set("Cache-Control", SEGMENT_CACHE);
+      } else {
+        outHeaders.set("Cache-Control", "private, no-store");
+      }
     }
 
     if (!outHeaders.has("Accept-Ranges")) outHeaders.set("Accept-Ranges", "bytes");
