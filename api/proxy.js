@@ -8,12 +8,10 @@ export const config = {
 // CONFIG
 // ═══════════════════════════════════════════════
 
-const MAX_REDIRECTS = 5;
 const UPSTREAM_TIMEOUT = 25000;
-const TEXT_LIMIT = 5 * 1024 * 1024;
-const SNIFF_LIMIT = 2 * 1024 * 1024;
-const PROBE_BYTES = 32 * 1024;      // Reduced from 128KB for speed
-const MASTER_BANDWIDTH = 2500000;    
+const PROBE_TIMEOUT = 4000;
+const PROBE_BYTES = 32 * 1024; // 32KB is enough to parse PAT/PMT headers
+const MASTER_BANDWIDTH = 2500000;
 
 const LANG_NAMES = {
   hin: "Hindi", tam: "Tamil", tel: "Telugu", kan: "Kannada", mal: "Malayalam",
@@ -37,10 +35,8 @@ const DEFAULT_UA =
 const BLOCKED_HEADERS = new Set([
   "connection", "proxy-connection", "keep-alive", "transfer-encoding",
   "upgrade", "te", "trailer", "proxy-authenticate", "proxy-authorization",
-  "host",
+  "host", "content-disposition", "content-type" // We will set these manually
 ]);
-
-const SECRET_HEADERS = new Set(["cookie", "authorization"]);
 
 const MIME_BY_EXT = {
   mp4: "video/mp4", m4v: "video/mp4", m4s: "video/mp4", webm: "video/webm",
@@ -63,11 +59,7 @@ function corsHeaders() {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
     "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": [
-      "Content-Length", "Content-Range", "Accept-Ranges", "Content-Type",
-      "ETag", "Last-Modified", "Content-Disposition", "Cache-Control",
-      "X-Upstream-Status", "X-Upstream-Attempts", "X-Proxy-Header-Names", "X-Proxy-Track",
-    ].join(", "),
+    "Access-Control-Expose-Headers": "*",
     "Cross-Origin-Resource-Policy": "cross-origin",
   };
 }
@@ -115,8 +107,8 @@ function textResponse(status, body, cache) {
     status,
     headers: {
       ...corsHeaders(),
-      "Content-Type": "application/vnd.apple.mpegurl",
-      "Content-Disposition": "inline",
+      "Content-Type": "application/vnd.apple.mpegurl", // Force native player
+      "Content-Disposition": "inline",                // Prevent download prompt
       "Cache-Control": cache
     },
   });
@@ -396,7 +388,6 @@ function makeTsFilter(track) {
       const audios = info.streams.filter((s) => s.kind === "audio");
       keep = track === "v" ? new Set(videos.map((s) => s.pid)) : new Set([audios[Number(track.slice(1))]?.pid].filter(Boolean));
 
-      // Fallback: if requested track doesn't exist, pass through original stream
       if (keep.size === 0) {
           passthrough = true;
           return pkt;
@@ -405,7 +396,6 @@ function makeTsFilter(track) {
       const first = keep.values().next();
       const pcr = keep.has(info.pcrPid) ? info.pcrPid : first.done ? 0x1fff : first.value;
 
-      // Build PMT
       const body = [];
       for (const st of info.streams) {
         if (!keep.has(st.pid)) continue;
@@ -456,7 +446,6 @@ function makeTsFilter(track) {
           carry = buf.slice(p);
           if (w) controller.enqueue(out.subarray(0, w));
       } catch (e) {
-          // Fallback to raw stream if filter fails
           controller.enqueue(chunk);
       }
     },
@@ -473,7 +462,7 @@ async function probeTracks(playlistText, playlistUrl, requestHeaders) {
     if (!first) return { audio: [], video: [] };
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s timeout for speed
+    const timeoutId = setTimeout(() => controller.abort(), PROBE_TIMEOUT);
 
     const headers = new Headers();
     for (const [k, v] of Object.entries(requestHeaders)) headers.set(k, v);
@@ -562,7 +551,6 @@ export default async function handler(req) {
     for (const [k, v] of Object.entries(requestHeaders)) upstreamHeaders.set(k, v);
     if (!upstreamHeaders.has("user-agent")) upstreamHeaders.set("User-Agent", DEFAULT_UA);
 
-    // Forward Range and If-Range headers from client request if not explicitly set in URL params
     const clientRange = req.headers.get("range");
     if (clientRange && !upstreamHeaders.has("range")) {
       upstreamHeaders.set("Range", clientRange);
@@ -599,7 +587,7 @@ export default async function handler(req) {
             return textResponse(200, buildMaster(root, target.href, requestHeaders, tracks.audio), "no-store");
           }
         } catch (e) {
-          // Ignore probe errors, fallback to rewriting
+          // Fallback to normal rewrite if probe fails
         }
       }
 
@@ -619,18 +607,20 @@ export default async function handler(req) {
           },
         });
       } catch (e) {
-        // Fallback to raw stream if filter fails
         return new Response(upstream.body, { status, headers: corsHeaders() });
       }
     }
 
     const outHeaders = new Headers(corsHeaders());
+    
+    // Forward safe headers (excluding blocked ones)
     upstream.headers.forEach((v, k) => { if (!BLOCKED_HEADERS.has(k)) outHeaders.set(k, v); });
 
-    // Force inline rendering for video/audio files so browsers do not trigger downloads
+    // --- CRITICAL FIX FOR PLAYBACK ---
+    // Force the correct Content-Type and inline disposition based on extension
     if (ext && MEDIA_EXT.has(ext)) {
       outHeaders.set("Content-Disposition", "inline");
-      if (!outHeaders.has("Content-Type") && MIME_BY_EXT[ext]) {
+      if (MIME_BY_EXT[ext]) {
         outHeaders.set("Content-Type", MIME_BY_EXT[ext]);
       }
       outHeaders.set("Cache-Control", "public, max-age=3600");
@@ -639,7 +629,6 @@ export default async function handler(req) {
       outHeaders.set("Cache-Control", "public, max-age=3600");
     }
 
-    // Indicate byte-seeking support to browser media engine
     if (!outHeaders.has("Accept-Ranges")) {
       outHeaders.set("Accept-Ranges", "bytes");
     }
